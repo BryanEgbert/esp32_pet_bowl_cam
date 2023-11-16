@@ -1,0 +1,6 @@
+{
+    "cmake.sourceDirectory": "/home/bryan/repos/pet_bowl_cam/.pio/libdeps/esp32cam/esp32-camera",
+    "clangd.arguments": [
+        "--compile-commands-dir=/home/bryan/repos/pet_bowl_cam/.pio/build/esp32cam/"
+    ]
+}
