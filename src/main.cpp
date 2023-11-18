@@ -10,6 +10,7 @@
 #include <FileHandler.hpp>
 #include <Base64.h>
 
+
 #include "credentials.hpp"
 #include "freertos/FreeRTOS.h"
 #include "esp_camera.h"
@@ -47,8 +48,6 @@ String nonce = "test";
 
 DynamicJsonDocument feedingScheduleDoc(1024);
 DynamicJsonDocument urlListDoc(128);
-
-HTTPClient httpClient;
 
 bool isProcessed = false;
 
@@ -396,7 +395,7 @@ void setup() {
       return; 
     }
 
-
+    // FIXME: Fix url value is empty when declared
     urlListDoc["url"] = json["url"];
     
 
@@ -643,6 +642,7 @@ void loop() {
       log_d("compare time: %d:%d | %d:%d", v["hour"].as<int>(), v["minutes"].as<int>(), timeinfo.tm_hour, timeinfo.tm_min);
       if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
         int retries = 0;
+        
         HTTPClient http;
         const char* boundary = "camBoundary";
 
@@ -653,11 +653,15 @@ void loop() {
         }
 
 
-        // int encodedLength = Base64.encodedLength(fb->len);
-        // log_d("Length: %d", encodedLength);
+        int encodedLength = Base64.encodedLength(fb->len);
+        log_d("Length: %d", encodedLength);
 
-        // char *encodedString = (char *)ps_malloc(encodedLength);
-        // Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
+        char* encodedString = (char*)malloc(encodedLength);
+        // String encodedString;
+        Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
+
+        esp_camera_fb_return(fb);
+        log_d("Deallocate camera framebuffer");
 
         const char* url = urlListDoc["url"].as<const char*>();
         log_d("url: %s", url);
@@ -665,7 +669,7 @@ void loop() {
         String reqBody = "--";
         reqBody += boundary;
         reqBody += "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-        reqBody += reinterpret_cast<const char*>(fb->buf);
+        reqBody += encodedString;
         reqBody += "\r\n--";
         reqBody += boundary;
         reqBody += "--\r\n";
@@ -673,57 +677,38 @@ void loop() {
         log_d("Request:\n%s", reqBody.c_str());
 
         log_d("start POST request");
+
+        http.setTimeout(1000);
         http.begin(url);
         http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
+        http.addHeader("accept", "application/json");
 
         int httpCode = http.POST(reqBody);
         log_d("Status code: %d", httpCode);
 
-        while (retries < 5) {
-          if (httpCode != HTTP_CODE_OK) {
+        if (httpCode != HTTP_CODE_OK) {
+          while (retries < 5) {
             retries++;
             log_d("retries: %d", retries);
           }
         }
 
-        // if (wifiClient.connect("192.168.100.25", 8000)) {
-        //   Serial.println("Connection successful!");    
-        //   String head = "--camBoundary\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"pet-bowl.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-        //   String tail = "\r\n--camBoundary--\r\n";
+        log_d("Getting response body");
+        String payload = http.getString();
+        log_d("response: %s\nlength: %d", payload.c_str(), payload.length());
 
-        //   uint32_t imageLen = fb->len;
-        //   uint32_t extraLen = head.length() + tail.length();
-        //   uint32_t totalLen = imageLen + extraLen;
-        
-        //   wifiClient.println("POST /classification/pet_bowl HTTP/1.1");
-        //   wifiClient.println("Host: 192.168.100.25");
-        //   wifiClient.println("Content-Length: " + String(totalLen));
-        //   wifiClient.println("Content-Type: multipart/form-data; boundary=camBoundary");
-        //   wifiClient.println();
-        //   wifiClient.print(head);
-        
-        //   uint8_t *fbBuf = fb->buf;
-        //   size_t fbLen = fb->len;
-        //   for (size_t n=0; n<fbLen; n=n+1024) {
-        //     if (n+1024 < fbLen) {
-        //       wifiClient.write(fbBuf, 1024);
-        //       fbBuf += 1024;
-        //     }
-        //     else if (fbLen%1024>0) {
-        //       size_t remainder = fbLen%1024;
-        //       wifiClient.write(fbBuf, remainder);
-        //     }
-        //   }
-        //   wifiClient.print(tail);
-        // }
-
-        esp_camera_fb_return(fb);
-        // free(encodedString);
         http.end();
+        log_d("HTTPClient end() called");
+
+        // FIXME: Corrupt heap error
+        // possible fix:
+        //  - add +1 byte
+        //  - maybe is deallocated already??
+        free(encodedString);
+        log_d("Successfully deallocate base64 variable");
       }
     }
 
-    log_d("time does not match");
     delay(60000);
   } else {
     delay(1000);
