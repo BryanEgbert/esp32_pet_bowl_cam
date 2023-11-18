@@ -7,7 +7,10 @@
 #include <FS.h>
 #include <ArduinoJson.h>
 #include <AsyncJson.h>
+#include <FileHandler.hpp>
+#include <Base64.h>
 
+#include "credentials.hpp"
 #include "freertos/FreeRTOS.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
@@ -37,13 +40,16 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 SemaphoreHandle_t endpointMutex, feedingScheduleMutex, urlFileMutex;
 
+FileHandler fileHandler(SPIFFS);
+
 const char* ntpServer = "pool.ntp.org";
 String nonce = "test";
 
 DynamicJsonDocument feedingScheduleDoc(1024);
-DynamicJsonDocument urlListDoc(65);
+DynamicJsonDocument urlListDoc(128);
 
 HTTPClient httpClient;
+
 bool isProcessed = false;
 
 const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
@@ -136,6 +142,12 @@ void feedTask(void *pvParameters) {
     }
 
     if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr) {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      digitalWrite(LED_BUILTIN, LOW);
+
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      digitalWrite(LED_BUILTIN, HIGH);
+
       JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
       for (JsonVariant v : arrDoc) {
         if(v["status"].as<bool>() == true) {
@@ -143,17 +155,32 @@ void feedTask(void *pvParameters) {
         }
 
 
-        if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
-          // TODO: Function to send data to server
-          vTaskDelay(500 / portTICK_PERIOD_MS);
-          digitalWrite(LED_BUILTIN, LOW);
+        // if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
+        //   int retries = 0;
+        //   HTTPClient http;
 
-          vTaskDelay(500 / portTICK_PERIOD_MS);
-          digitalWrite(LED_BUILTIN, HIGH);
-        }
+        //   // camera_fb_t* fb = esp_camera_fb_get();
+        //   // if (!fb) {
+        //   //   continue;
+        //   // }
+
+        //   http.begin("https://google.com");
+        //   // int httpCode = http.POST(fb->buf, fb->len);
+        //   int httpCode = http.GET();
+
+        //   // if (httpCode != HTTP_CODE_OK) {
+        //   //   retries++;
+        //   //   log_d("retries: %d", retries);
+        //   // }
+        //   // while (retries < 5) {
+        //   // }
+
+        //   // esp_camera_fb_return(fb);
+        //   http.end();
+        // }
       }
 
-      vTaskDelay(60000 / portTICK_PERIOD_MS);
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
     } else {
       vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
@@ -169,81 +196,34 @@ void setup() {
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
   
-  if(!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS Mount Failed");
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Error mounting spiffs");
     return;
   }
 
-  if (SPIFFS.exists(FEEDING_SCHEDULE_FILE_PATH)) {
-    String fileContent;
-    File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH);
-    if (!file) {
-      Serial.println("Failed to open file");
-      file.close();
-
-      return;
-    }
-
-    while (file.available()) {
-      fileContent += char(file.read());
-    }
-
-    file.close();
-
-    deserializeJson(feedingScheduleDoc, fileContent);
-  } else {
-    // Write file
-    File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      Serial.println("Failed to create file");
-      file.close();
-
-      return;
-    }
-
-    file.close();
+  if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
+    Serial.println("Failed to create file");
+    return;
   }
 
-  if (SPIFFS.exists(URL_LIST_FILE_PATH)) {
-    String fileContent;
-    File file = SPIFFS.open(URL_LIST_FILE_PATH);
-    if (!file) {
-      Serial.println("Failed to open file");
-      file.close();
-
-      return;
-    }
-
-    while (file.available()) {
-      fileContent += char(file.read());
-    }
-
-    file.close();
-
-    deserializeJson(urlListDoc, fileContent);
-  } else {
-    // Write file
-    File file = SPIFFS.open(URL_LIST_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      Serial.println("Failed to create file");
-      file.close();
-
-      return;
-    }
-
-    urlListDoc["url"] = "";
-
-    if (file.print("{\"url\": \"\"}")) {
-      Serial.println("Error writing to a file");
-      file.close();
-
-      return;
-    }
-
-
-    file.close();
+  if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+    Serial.println("Failed to read file content");
+    return;
   }
-  // list dir
+
+  if (!SPIFFS.exists(URL_LIST_FILE_PATH)) {
+    if (fileHandler.createFile(URL_LIST_FILE_PATH)) {
+      urlListDoc["url"] = "";
+      fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc);
+    }
+  }
+
+
+  if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+    Serial.println("Failed to read url file");
+    return;
+  }
+  
   File root = SPIFFS.open("/");
   if(!root){
       Serial.println("- failed to open directory");
@@ -275,8 +255,8 @@ void setup() {
   // Init WiFi
   WiFi.mode(WIFI_AP_STA);
   WiFi.onEvent(WiFiEvent);
-  WiFi.begin("RumahCs_KM", "KhengSadikun0612");
-  WiFi.softAP("ESP32CAM_PetBowlCam", "1234567890");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.softAP(AP_SSID, AP_PASS);
 
   digitalWrite(LED_BUILTIN, HIGH);
 
@@ -340,23 +320,23 @@ void setup() {
   sensor->set_framesize(sensor, FRAMESIZE_QVGA);
 
   // Init server
-  server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
-    camera_fb_t* fb = esp_camera_fb_get();
+  // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
+  //   camera_fb_t* fb = esp_camera_fb_get();
 
-    if (!fb) {
-      request->send(500, "text/plain", "failed to capture photo\n");
-      return;
-    }
+  //   if (!fb) {
+  //     request->send(500, "text/plain", "failed to capture photo\n");
+  //     return;
+  //   }
 
-    // request->send(200, "text/jpeg", );
-    AsyncWebServerResponse *response = request->beginResponse_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
-    // response->addHeader("Content-Encoding", "gzip");
-    response->addHeader("Content-Disposition", "inline");
-    response->addHeader("Access-Control-Allow-Origin", "*");
-    esp_camera_fb_return(fb);
+  //   // request->send(200, "text/jpeg", );
+  //   AsyncWebServerResponse *response = request->beginResponse_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
+  //   // response->addHeader("Content-Encoding", "gzip");
+  //   response->addHeader("Content-Disposition", "inline");
+  //   response->addHeader("Access-Control-Allow-Origin", "*");
+  //   esp_camera_fb_return(fb);
 
-    request->send(response);
-  });
+  //   request->send(response);
+  // });
 
   server.on("/prediction", HTTP_POST, [](AsyncWebServerRequest* request) {
     if (xSemaphoreTake(endpointMutex, portMAX_DELAY) != pdTRUE) {
@@ -400,20 +380,13 @@ void setup() {
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, URL_LIST_FILE_PATH, "application/json");
-
-    if (xSemaphoreTake(urlFileMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "internal server error");
-
-      return;
-    }
-
-
   });
 
-  server.on("/url", HTTP_PUT, [](AsyncWebServerRequest* request) {
-    if (!request->hasParam("url", true)) {
-      request->send(400, "application/json", "{\"message\": \"missing id field\"}");
-
+  AsyncCallbackJsonWebHandler* urlListPostHandler = 
+    new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
+      
+    if (!json.containsKey("url")) {
+      request->send(400, "application/json", "{\"message\": \"missing url field\"}");
       return;
     }
 
@@ -423,7 +396,9 @@ void setup() {
       return; 
     }
 
-    urlListDoc["url"] = request->getParam("url", true)->value();
+
+    urlListDoc["url"] = json["url"];
+    
 
     File file = SPIFFS.open(URL_LIST_FILE_PATH, FILE_WRITE);
     if (!file) {
@@ -439,8 +414,40 @@ void setup() {
     
     request->send(204);
     
-    xSemaphoreGive(urlFileMutex);    
+    xSemaphoreGive(urlFileMutex);  
   });
+
+  // server.on("/url", HTTP_PUT, [](AsyncWebServerRequest* request) {
+  //   if (!request->hasParam("url", true)) {
+  //     request->send(400, "application/json", "{\"message\": \"missing id field\"}");
+
+  //     return;
+  //   }
+
+  //   if (xSemaphoreTake(urlFileMutex, portMAX_DELAY) != pdTRUE) {
+  //     request->send(500, "text/plain", "max client allowed");
+
+  //     return; 
+  //   }
+
+  //   urlListDoc["url"] = request->getParam("url", true)->value();
+
+  //   // File file = SPIFFS.open(URL_LIST_FILE_PATH, FILE_WRITE);
+  //   // if (!file) {
+  //   //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+  //   //   file.close();
+  //   //   xSemaphoreGive(urlFileMutex);
+
+  //   //   return;
+  //   // }
+
+  //   // serializeJson(urlListDoc, file);
+  //   // file.close();
+    
+  //   // request->send(204);
+    
+  //   // xSemaphoreGive(urlFileMutex);    
+  // });
 
   server.on("/feeding_schedule", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, FEEDING_SCHEDULE_FILE_PATH, "application/json");
@@ -455,27 +462,38 @@ void setup() {
 
     if (xSemaphoreTake(feedingScheduleMutex, portMAX_DELAY) != pdTRUE) {
       request->send(500, "text/plain", "internal server error");
-      xSemaphoreGive(feedingScheduleMutex);
 
       return;
     }
 
-    JsonObject data = json.as<JsonObject>();
-    if (!data.containsKey("hour") || !data.containsKey("minutes") || !data.containsKey("seconds")) {
+    if (!json.containsKey("hour") || !json.containsKey("minutes") || !json.containsKey("seconds")) {
       request->send(400, "application/json", "{\"message\": \"missing required field\"}\n");
       xSemaphoreGive(feedingScheduleMutex);      
 
       return;
     }
 
-    if (data.containsKey("id")) {
-      int id = data["id"].as<int>();
-      data.remove("id");
-      feedingScheduleDoc[id] = data;
-    } else {
-      data["status"] = 0;
+    if (json.containsKey("id")) {
+      int id = json["id"].as<int>();
+      if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
+        request->send(200);
+        xSemaphoreGive(feedingScheduleMutex);
 
-      if (!feedingScheduleDoc.add(data)) {
+        return;
+      }
+      
+      if (!json.containsKey("status")) {
+        json["status"] = 0;
+      }
+
+      feedingScheduleDoc[id - 1]["hour"] = json["hour"];
+      feedingScheduleDoc[id - 1]["minutes"] = json["minutes"];
+      feedingScheduleDoc[id - 1]["seconds"] = json["seconds"];
+      feedingScheduleDoc[id - 1]["status"] = json["status"];
+    } else {
+      json["status"] = 0;
+
+      if (!feedingScheduleDoc.add(json)) {
         request->send(500, "application/json", "{\"message\": \"failed adding data to variable\"}\n");
         xSemaphoreGive(feedingScheduleMutex);      
 
@@ -510,7 +528,7 @@ void setup() {
     
     AsyncWebParameter* idParam = request->getParam("id");
     int id = idParam->value().toInt();
-    if (id < 1 || id > feedingScheduleDoc.to<JsonArray>().size()) {
+    if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
       request->send(200);
 
       return;
@@ -546,18 +564,22 @@ void setup() {
 
   server.addHandler(&ws);
   server.addHandler(feedingSchedulePostHandler);
+  server.addHandler(urlListPostHandler);
+
   server.begin();
 
   configTime(0, 0, ntpServer);
   setenv("TZ", "WIB-7", 1);
   tzset();
 
-  BaseType_t xReturned = xTaskCreate(feedTask, "FeedTask", 1024, NULL, 2, NULL);
-  if (xReturned == pdPASS) {
-    Serial.println("Successfully create a task");
-  }
+  // BaseType_t xReturned = xTaskCreate(feedTask, "FeedTask", 1024, NULL, configMAX_PRIORITIES - 1, NULL);
+  // if (xReturned == pdPASS) {
+  //   log_d("Successfully create a task");
+  // } else {
+  //   log_d("Failed to create a task");
+  // }
 
-  vTaskStartScheduler();
+  // vTaskStartScheduler();
 
 }
 
@@ -596,6 +618,116 @@ void printLocalTime() {
 }
 
 void loop() {
+  struct tm timeinfo;
+  // log_d("Total heap: %d", ESP.getHeapSize());
+  // log_d("Free heap: %d", ESP.getFreeHeap());
+  // log_d("Total PSRAM: %d", ESP.getPsramSize());
+  // log_d("Free PSRAM: %d", ESP.getFreePsram());
+  // log_d("------------------------------------");
+
+  log_d("Getting local time");
+  if(!getLocalTime(&timeinfo)){
+    return;
+  } else {
+    log_d("Successfully fetch local time");
+  }
+
+  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr) {
+    JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
+    for (JsonVariant v : arrDoc) {
+      if(v["status"].as<bool>() == true) {
+        log_d("Status is true");
+        continue;
+      }
+
+      log_d("compare time: %d:%d | %d:%d", v["hour"].as<int>(), v["minutes"].as<int>(), timeinfo.tm_hour, timeinfo.tm_min);
+      if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
+        int retries = 0;
+        HTTPClient http;
+        const char* boundary = "camBoundary";
+
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+          log_d("Failed at getting camera framebuffer");
+          continue;
+        }
+
+
+        // int encodedLength = Base64.encodedLength(fb->len);
+        // log_d("Length: %d", encodedLength);
+
+        // char *encodedString = (char *)ps_malloc(encodedLength);
+        // Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
+
+        const char* url = urlListDoc["url"].as<const char*>();
+        log_d("url: %s", url);
+
+        String reqBody = "--";
+        reqBody += boundary;
+        reqBody += "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        reqBody += reinterpret_cast<const char*>(fb->buf);
+        reqBody += "\r\n--";
+        reqBody += boundary;
+        reqBody += "--\r\n";
+
+        log_d("Request:\n%s", reqBody.c_str());
+
+        log_d("start POST request");
+        http.begin(url);
+        http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
+
+        int httpCode = http.POST(reqBody);
+        log_d("Status code: %d", httpCode);
+
+        while (retries < 5) {
+          if (httpCode != HTTP_CODE_OK) {
+            retries++;
+            log_d("retries: %d", retries);
+          }
+        }
+
+        // if (wifiClient.connect("192.168.100.25", 8000)) {
+        //   Serial.println("Connection successful!");    
+        //   String head = "--camBoundary\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"pet-bowl.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        //   String tail = "\r\n--camBoundary--\r\n";
+
+        //   uint32_t imageLen = fb->len;
+        //   uint32_t extraLen = head.length() + tail.length();
+        //   uint32_t totalLen = imageLen + extraLen;
+        
+        //   wifiClient.println("POST /classification/pet_bowl HTTP/1.1");
+        //   wifiClient.println("Host: 192.168.100.25");
+        //   wifiClient.println("Content-Length: " + String(totalLen));
+        //   wifiClient.println("Content-Type: multipart/form-data; boundary=camBoundary");
+        //   wifiClient.println();
+        //   wifiClient.print(head);
+        
+        //   uint8_t *fbBuf = fb->buf;
+        //   size_t fbLen = fb->len;
+        //   for (size_t n=0; n<fbLen; n=n+1024) {
+        //     if (n+1024 < fbLen) {
+        //       wifiClient.write(fbBuf, 1024);
+        //       fbBuf += 1024;
+        //     }
+        //     else if (fbLen%1024>0) {
+        //       size_t remainder = fbLen%1024;
+        //       wifiClient.write(fbBuf, remainder);
+        //     }
+        //   }
+        //   wifiClient.print(tail);
+        // }
+
+        esp_camera_fb_return(fb);
+        // free(encodedString);
+        http.end();
+      }
+    }
+
+    log_d("time does not match");
+    delay(60000);
+  } else {
+    delay(1000);
+  }
   // // put your main code here, to run repeatedly:
   // digitalWrite(LED_BUILTIN, HIGH);
 
