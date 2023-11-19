@@ -656,7 +656,7 @@ void loop() {
         int encodedLength = Base64.encodedLength(fb->len);
         log_d("Length: %d", encodedLength);
 
-        char* encodedString = (char*)malloc(encodedLength);
+        char* encodedString = (char*)malloc(encodedLength * sizeof(char) + 1);
         // String encodedString;
         Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
 
@@ -700,10 +700,6 @@ void loop() {
         http.end();
         log_d("HTTPClient end() called");
 
-        // FIXME: Corrupt heap error
-        // possible fix:
-        //  - add +1 byte
-        //  - maybe is deallocated already??
         free(encodedString);
         log_d("Successfully deallocate base64 variable");
       }
