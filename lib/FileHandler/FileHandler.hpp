@@ -11,6 +11,8 @@ public:
     bool createFile(const char* filePath);
     bool readJson(const char* filePath, JsonDocument& doc);
     bool writeJson(const char* filePath, const JsonDocument& doc);
+    bool writeJson(const char* filePath, const JsonArray& doc);
+    bool writeJson(const char* filePath, const JsonObject& doc);
 private:
     fs::FS& m_fs;
 };

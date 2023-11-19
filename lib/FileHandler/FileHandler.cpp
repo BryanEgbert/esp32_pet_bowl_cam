@@ -56,3 +56,33 @@ bool FileHandler::writeJson(const char* filePath, const JsonDocument& doc) {
 
     return true;
 }
+
+bool FileHandler::writeJson(const char* filePath, const JsonArray& doc) {
+    File file = this->m_fs.open(filePath, FILE_WRITE);
+    if (!file) {
+      file.close();
+
+      return false;
+    }
+
+    serializeJson(doc, file);
+    
+    file.close();
+
+    return true;
+}
+
+bool FileHandler::writeJson(const char* filePath, const JsonObject& doc) {
+    File file = this->m_fs.open(filePath, FILE_WRITE);
+    if (!file) {
+      file.close();
+
+      return false;
+    }
+
+    serializeJson(doc, file);
+    
+    file.close();
+
+    return true;
+}

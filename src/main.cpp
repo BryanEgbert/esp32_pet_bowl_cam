@@ -47,7 +47,8 @@ const char* ntpServer = "pool.ntp.org";
 String nonce = "test";
 
 DynamicJsonDocument feedingScheduleDoc(1024);
-DynamicJsonDocument urlListDoc(128);
+static DynamicJsonDocument urlListDoc(128);
+DynamicJsonDocument httpPredictionResponseDoc(192);
 
 bool isProcessed = false;
 
@@ -200,26 +201,45 @@ void setup() {
     return;
   }
 
+  SPIFFS.remove("/pet_bowl_cam.db");
+  SPIFFS.remove("/feeding_schedule.json");
+  SPIFFS.remove("/url_list.json");
+
   if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
-    Serial.println("Failed to create file");
+    // fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc);
+    log_d("Failed to create file content");
+    return;
+  }
+
+  JsonArray feedingScheduleObj = feedingScheduleDoc.to<JsonArray>();
+
+  if (!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleObj)) {
+    log_d("Failed to write to file");
     return;
   }
 
   if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-    Serial.println("Failed to read file content");
+    log_d("Failed to read file content");
     return;
   }
 
-  if (!SPIFFS.exists(URL_LIST_FILE_PATH)) {
-    if (fileHandler.createFile(URL_LIST_FILE_PATH)) {
-      urlListDoc["url"] = "";
-      fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc);
-    }
+  if (!fileHandler.createFile(URL_LIST_FILE_PATH)) {
+    // urlListDoc.set("{}");
+    // fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc);
+    log_d("Failed to create file content");
+    return;
   }
 
+  JsonObject urlListObj = urlListDoc.to<JsonObject>();
+  urlListObj["url"] = "";
+
+  if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListObj)) {
+    log_d("Failed to write to file");
+    return;
+  }
 
   if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    Serial.println("Failed to read url file");
+    log_d("Failed to read url file");
     return;
   }
   
@@ -383,7 +403,7 @@ void setup() {
 
   AsyncCallbackJsonWebHandler* urlListPostHandler = 
     new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
-      
+  
     if (!json.containsKey("url")) {
       request->send(400, "application/json", "{\"message\": \"missing url field\"}");
       return;
@@ -395,25 +415,26 @@ void setup() {
       return; 
     }
 
-    // FIXME: Fix url value is empty when declared
-    urlListDoc["url"] = json["url"];
-    
+    FileHandler fileHandler(SPIFFS);
 
-    File file = SPIFFS.open(URL_LIST_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      file.close();
+    if(!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
       xSemaphoreGive(urlFileMutex);
 
       return;
     }
 
-    serializeJson(urlListDoc, file);
-    file.close();
-    
+    urlListDoc["url"] = json["url"];
+
+    if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+      xSemaphoreGive(urlFileMutex);
+
+      return;
+    }
+
     request->send(204);
-    
-    xSemaphoreGive(urlFileMutex);  
+    xSemaphoreGive(urlFileMutex);
   });
 
   // server.on("/url", HTTP_PUT, [](AsyncWebServerRequest* request) {
@@ -472,6 +493,15 @@ void setup() {
       return;
     }
 
+    FileHandler fileHandler(SPIFFS);
+
+    if(!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(feedingScheduleMutex);
+
+      return;
+    }
+
     if (json.containsKey("id")) {
       int id = json["id"].as<int>();
       if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
@@ -489,10 +519,12 @@ void setup() {
       feedingScheduleDoc[id - 1]["minutes"] = json["minutes"];
       feedingScheduleDoc[id - 1]["seconds"] = json["seconds"];
       feedingScheduleDoc[id - 1]["status"] = json["status"];
+
+      feedingScheduleDoc.garbageCollect();
     } else {
       json["status"] = 0;
 
-      if (!feedingScheduleDoc.add(json)) {
+      if (!feedingScheduleDoc.add(json.as<JsonObject>())) {
         request->send(500, "application/json", "{\"message\": \"failed adding data to variable\"}\n");
         xSemaphoreGive(feedingScheduleMutex);      
 
@@ -500,35 +532,19 @@ void setup() {
       }
     }
 
-    File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      file.close();
+    if(!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}\n");
       xSemaphoreGive(feedingScheduleMutex);
 
-      return;
-    } else {
-      serializeJson(feedingScheduleDoc, file);
-
-      file.close();
-      request->send(201);
-
-      xSemaphoreGive(feedingScheduleMutex);
     }
 
+    request->send(201);
+    xSemaphoreGive(feedingScheduleMutex);
   });
 
   server.on("/feeding_schedule", HTTP_DELETE, [](AsyncWebServerRequest* request) {
     if (!request->hasParam("id")) {
       request->send(400, "application/json", "{\"message\": \"missing id field\"}");
-
-      return;
-    }
-    
-    AsyncWebParameter* idParam = request->getParam("id");
-    int id = idParam->value().toInt();
-    if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
-      request->send(200);
 
       return;
     }
@@ -540,20 +556,44 @@ void setup() {
       return;
     }
 
-    feedingScheduleDoc.remove(id - 1);
+    FileHandler fileHandler(SPIFFS);
 
-    File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      file.close();
+    if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)){
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(feedingScheduleMutex);
+
+      return;
+    }
+    
+    AsyncWebParameter* idParam = request->getParam("id");
+    int id = idParam->value().toInt();
+    if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
+      request->send(200);
       xSemaphoreGive(feedingScheduleMutex);
 
       return;
     }
 
-    serializeJson(feedingScheduleDoc, file);
+    feedingScheduleDoc.remove(id - 1);
+    if (!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+      xSemaphoreGive(feedingScheduleMutex);
 
-    file.close();
+      return;
+    }
+
+    // File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH, FILE_WRITE);
+    // if (!file) {
+    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+    //   file.close();
+    //   xSemaphoreGive(feedingScheduleMutex);
+
+    //   return;
+    // }
+
+    // serializeJson(feedingScheduleDoc, file);
+
+    // file.close();
     request->send(200);
 
     xSemaphoreGive(feedingScheduleMutex);
@@ -570,16 +610,6 @@ void setup() {
   configTime(0, 0, ntpServer);
   setenv("TZ", "WIB-7", 1);
   tzset();
-
-  // BaseType_t xReturned = xTaskCreate(feedTask, "FeedTask", 1024, NULL, configMAX_PRIORITIES - 1, NULL);
-  // if (xReturned == pdPASS) {
-  //   log_d("Successfully create a task");
-  // } else {
-  //   log_d("Failed to create a task");
-  // }
-
-  // vTaskStartScheduler();
-
 }
 
 void printLocalTime() {
@@ -618,11 +648,6 @@ void printLocalTime() {
 
 void loop() {
   struct tm timeinfo;
-  // log_d("Total heap: %d", ESP.getHeapSize());
-  // log_d("Free heap: %d", ESP.getFreeHeap());
-  // log_d("Total PSRAM: %d", ESP.getPsramSize());
-  // log_d("Free PSRAM: %d", ESP.getFreePsram());
-  // log_d("------------------------------------");
 
   log_d("Getting local time");
   if(!getLocalTime(&timeinfo)){
@@ -632,6 +657,14 @@ void loop() {
   }
 
   if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr) {
+    if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+      return;
+    }
+
+    if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+      return;
+    }
+
     JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
     for (JsonVariant v : arrDoc) {
       if(v["status"].as<bool>() == true) {
@@ -663,23 +696,17 @@ void loop() {
         esp_camera_fb_return(fb);
         log_d("Deallocate camera framebuffer");
 
-        const char* url = urlListDoc["url"].as<const char*>();
-        log_d("url: %s", url);
+        const char* url = urlListDoc["url"];
+        log_d("url: %s", urlListDoc["url"].as<const char*>());
 
-        String reqBody = "--";
-        reqBody += boundary;
-        reqBody += "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
         reqBody += encodedString;
-        reqBody += "\r\n--";
-        reqBody += boundary;
-        reqBody += "--\r\n";
-
-        log_d("Request:\n%s", reqBody.c_str());
+        reqBody += "\r\n--camBoundary--\r\n";
 
         log_d("start POST request");
 
         http.setTimeout(1000);
-        http.begin(url);
+        http.begin(urlListDoc["url"].as<const char*>());
         http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
         http.addHeader("accept", "application/json");
 
@@ -689,13 +716,16 @@ void loop() {
         if (httpCode != HTTP_CODE_OK) {
           while (retries < 5) {
             retries++;
-            log_d("retries: %d", retries);
+            httpCode = http.POST(reqBody);
           }
         }
 
         log_d("Getting response body");
         String payload = http.getString();
-        log_d("response: %s\nlength: %d", payload.c_str(), payload.length());
+        log_d("length: %d", payload.length());
+
+        deserializeJson(httpPredictionResponseDoc, payload);
+        serializeJson(httpPredictionResponseDoc, Serial);
 
         http.end();
         log_d("HTTPClient end() called");
