@@ -39,7 +39,7 @@
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-SemaphoreHandle_t endpointMutex, feedingScheduleMutex, urlFileMutex;
+SemaphoreHandle_t endpointMutex, feedingScheduleMutex, urlFileMutex, tzFileMutex;
 
 FileHandler fileHandler(SPIFFS);
 
@@ -47,13 +47,15 @@ const char* ntpServer = "pool.ntp.org";
 String nonce = "test";
 
 DynamicJsonDocument feedingScheduleDoc(1024);
-static DynamicJsonDocument urlListDoc(128);
+DynamicJsonDocument urlListDoc(192);
 DynamicJsonDocument httpPredictionResponseDoc(192);
+DynamicJsonDocument tzDoc(64);
 
 bool isProcessed = false;
 
 const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
 const char* URL_LIST_FILE_PATH = "/url_list.json";
+const char* TZ_FILE_PATH = "/timezone.json";
 
 void printLocalTime();
 
@@ -188,6 +190,12 @@ void feedTask(void *pvParameters) {
   }
 }
 
+/* TODO: Add json file to store
+*   - WiFi STA credentials
+*   - Servo open in milliseconds
+*   - Weight sensor value to notify through MQTT
+*   - Servo should open if ai server is not available (timed out / max retries)
+*/
 void setup() {
 
   Serial.begin(115200);
@@ -195,27 +203,30 @@ void setup() {
   endpointMutex = xSemaphoreCreateMutex();
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
+  tzFileMutex = xSemaphoreCreateMutex();
+
+  if (feedingScheduleMutex == nullptr || urlFileMutex == nullptr || tzFileMutex == nullptr) {
+    log_d("Error initializing mutex, restarting...");
+    ESP.restart();
+  }
   
   if (!SPIFFS.begin(true)) {
     Serial.println("Error mounting spiffs");
     return;
   }
 
-  SPIFFS.remove("/pet_bowl_cam.db");
-  SPIFFS.remove("/feeding_schedule.json");
-  SPIFFS.remove("/url_list.json");
+  if (!SPIFFS.exists(FEEDING_SCHEDULE_FILE_PATH)) {
+    if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
+      log_d("Failed to create file content");
+      return;
+    }
 
-  if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
-    // fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc);
-    log_d("Failed to create file content");
-    return;
-  }
+    JsonArray feedingScheduleObj = feedingScheduleDoc.to<JsonArray>();
 
-  JsonArray feedingScheduleObj = feedingScheduleDoc.to<JsonArray>();
-
-  if (!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleObj)) {
-    log_d("Failed to write to file");
-    return;
+    if (!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleObj)) {
+      log_d("Failed to write to file");
+      return;
+    }
   }
 
   if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
@@ -223,25 +234,46 @@ void setup() {
     return;
   }
 
-  if (!fileHandler.createFile(URL_LIST_FILE_PATH)) {
-    // urlListDoc.set("{}");
-    // fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc);
-    log_d("Failed to create file content");
-    return;
-  }
+  if (!SPIFFS.exists(URL_LIST_FILE_PATH)) {
+    if (!fileHandler.createFile(URL_LIST_FILE_PATH)) {
+      log_d("Failed to create file content");
+      return;
+    }
 
-  JsonObject urlListObj = urlListDoc.to<JsonObject>();
-  urlListObj["url"] = "";
+    JsonObject urlListObj = urlListDoc.to<JsonObject>();
+    urlListObj["aiUrl"] = "";
+    urlListObj["mqttUrl"] = "";
 
-  if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListObj)) {
-    log_d("Failed to write to file");
-    return;
+    if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListObj)) {
+      log_d("Failed to write to file");
+      return;
+    }
   }
 
   if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
     log_d("Failed to read url file");
     return;
   }
+
+  if (!SPIFFS.exists(TZ_FILE_PATH)) {
+    if (!fileHandler.createFile(TZ_FILE_PATH)) {
+      log_d("Failed to create file content");
+      return;
+    }
+
+    JsonObject tzObj = tzDoc.to<JsonObject>();
+    tzObj["tz"] = "UTC0";
+
+    if (!fileHandler.writeJson(TZ_FILE_PATH, tzObj)) {
+      log_d("Failed to write to file");
+      return;
+    }
+  }
+
+  if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)) {
+    log_d("Failed to read url file");
+    return;
+  }  
   
   File root = SPIFFS.open("/");
   if(!root){
@@ -404,7 +436,7 @@ void setup() {
   AsyncCallbackJsonWebHandler* urlListPostHandler = 
     new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
   
-    if (!json.containsKey("url")) {
+    if (!json.containsKey("aiUrl") || !json.containsKey("mqttUrl")) {
       request->send(400, "application/json", "{\"message\": \"missing url field\"}");
       return;
     }
@@ -424,7 +456,8 @@ void setup() {
       return;
     }
 
-    urlListDoc["url"] = json["url"];
+    urlListDoc["aiUrl"] = json["aiUrl"].as<const char*>();
+    urlListDoc["mqttUrl"] = json["mqttUrl"].as<const char*>();
 
     if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
       request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
@@ -502,9 +535,11 @@ void setup() {
       return;
     }
 
+    size_t feedingScheduleSize = feedingScheduleDoc.as<JsonArray>().size();
+
     if (json.containsKey("id")) {
       int id = json["id"].as<int>();
-      if (id < 1 || id > feedingScheduleDoc.as<JsonArray>().size()) {
+      if (id < 1 || id > feedingScheduleSize) {
         request->send(200);
         xSemaphoreGive(feedingScheduleMutex);
 
@@ -522,6 +557,13 @@ void setup() {
 
       feedingScheduleDoc.garbageCollect();
     } else {
+      if (feedingScheduleSize > 5) {
+        request->send(403, "application/json", "{\"message\": \"maximum capacity of feeding schedules\"}\n");
+        xSemaphoreGive(feedingScheduleMutex);
+
+        return;
+      }
+
       json["status"] = 0;
 
       if (!feedingScheduleDoc.add(json.as<JsonObject>())) {
@@ -582,21 +624,59 @@ void setup() {
       return;
     }
 
-    // File file = SPIFFS.open(FEEDING_SCHEDULE_FILE_PATH, FILE_WRITE);
-    // if (!file) {
-    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-    //   file.close();
-    //   xSemaphoreGive(feedingScheduleMutex);
-
-    //   return;
-    // }
-
-    // serializeJson(feedingScheduleDoc, file);
-
-    // file.close();
     request->send(200);
 
     xSemaphoreGive(feedingScheduleMutex);
+  });
+
+  server.on("/tz", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, TZ_FILE_PATH, "application/json");
+  });
+
+  server.on("/tz", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("tz", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing tz field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(tzFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+      xSemaphoreGive(tzFileMutex);
+
+      return;
+    }
+
+    FileHandler fileHandler(SPIFFS);
+
+    if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)){
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(tzFileMutex);
+
+      return;
+    }
+
+    AsyncWebParameter* tzParam = request->getParam("tz", true);
+    if (tzParam->value() == "") {
+      request->send(400, "application/json", "{\"message\": \"tz field cannot be empty\"}");
+      xSemaphoreGive(tzFileMutex);
+
+      return;
+    }
+
+    tzDoc["tz"] = tzParam->value();
+
+    if (!fileHandler.writeJson(TZ_FILE_PATH, tzDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+      xSemaphoreGive(tzFileMutex);
+
+      return;
+    }
+
+    setenv("TZ", tzParam->value().c_str(), 1);
+    tzset();
+
+    request->send(204);
+    xSemaphoreGive(tzFileMutex);
   });
 
   ws.onEvent(onEvent);
@@ -608,7 +688,7 @@ void setup() {
   server.begin();
 
   configTime(0, 0, ntpServer);
-  setenv("TZ", "WIB-7", 1);
+  setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
   tzset();
 }
 
@@ -656,7 +736,9 @@ void loop() {
     log_d("Successfully fetch local time");
   }
 
-  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr) {
+  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr && 
+      xSemaphoreGetMutexHolder(urlFileMutex) == nullptr &&
+      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr) {
     if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
       return;
     }
@@ -674,10 +756,14 @@ void loop() {
 
       log_d("compare time: %d:%d | %d:%d", v["hour"].as<int>(), v["minutes"].as<int>(), timeinfo.tm_hour, timeinfo.tm_min);
       if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
+        String url = urlListDoc["aiUrl"].as<String>();
+        if (url == nullptr || url == "") {
+          log_d("AI URL is empty");          
+          return;
+        }
+
         int retries = 0;
-        
         HTTPClient http;
-        const char* boundary = "camBoundary";
 
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) {
@@ -690,14 +776,10 @@ void loop() {
         log_d("Length: %d", encodedLength);
 
         char* encodedString = (char*)malloc(encodedLength * sizeof(char) + 1);
-        // String encodedString;
         Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
 
         esp_camera_fb_return(fb);
         log_d("Deallocate camera framebuffer");
-
-        const char* url = urlListDoc["url"];
-        log_d("url: %s", urlListDoc["url"].as<const char*>());
 
         String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
         reqBody += encodedString;
@@ -706,7 +788,7 @@ void loop() {
         log_d("start POST request");
 
         http.setTimeout(1000);
-        http.begin(urlListDoc["url"].as<const char*>());
+        http.begin(url.c_str());
         http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
         http.addHeader("accept", "application/json");
 
