@@ -39,25 +39,39 @@
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-SemaphoreHandle_t endpointMutex, feedingScheduleMutex, urlFileMutex, tzFileMutex;
+SemaphoreHandle_t endpointMutex, 
+                  feedingScheduleMutex, 
+                  urlFileMutex, 
+                  tzFileMutex,
+                  wifiFileMutex;
 
 FileHandler fileHandler(SPIFFS);
 
 const char* ntpServer = "pool.ntp.org";
 String nonce = "test";
 
-DynamicJsonDocument feedingScheduleDoc(1024);
+DynamicJsonDocument feedingScheduleDoc(384);
 DynamicJsonDocument urlListDoc(192);
 DynamicJsonDocument httpPredictionResponseDoc(192);
 DynamicJsonDocument tzDoc(64);
+DynamicJsonDocument wifiCredentialsDoc(128);
 
 bool isProcessed = false;
 
 const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
 const char* URL_LIST_FILE_PATH = "/url_list.json";
 const char* TZ_FILE_PATH = "/timezone.json";
+const char* WIFI_CRED_FILE_PATH = "/wifi_cred.json";
 
 void printLocalTime();
+
+void printScannedWifi() {
+  int numNetworks = WiFi.scanNetworks();
+  for (int i = 0; i < numNetworks; ++i) {
+    Serial.print(WiFi.SSID(i));
+    Serial.printf(" | (%4d) | [%2d]\n", WiFi.RSSI(i), WiFi.channel(i));
+  }
+}
 
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
@@ -195,6 +209,7 @@ void feedTask(void *pvParameters) {
 *   - Servo open in milliseconds
 *   - Weight sensor value to notify through MQTT
 *   - Servo should open if ai server is not available (timed out / max retries)
+*   - Handle ai server output, update status to true
 */
 void setup() {
 
@@ -204,9 +219,13 @@ void setup() {
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
   tzFileMutex = xSemaphoreCreateMutex();
+  wifiFileMutex = xSemaphoreCreateMutex();
 
-  if (feedingScheduleMutex == nullptr || urlFileMutex == nullptr || tzFileMutex == nullptr) {
-    log_d("Error initializing mutex, restarting...");
+  if (feedingScheduleMutex == nullptr || 
+      urlFileMutex == nullptr || 
+      tzFileMutex == nullptr ||
+      wifiFileMutex == nullptr) {
+    log_e("Error initializing mutex, restarting...");
     ESP.restart();
   }
   
@@ -215,28 +234,30 @@ void setup() {
     return;
   }
 
+  SPIFFS.remove(FEEDING_SCHEDULE_FILE_PATH);
+
   if (!SPIFFS.exists(FEEDING_SCHEDULE_FILE_PATH)) {
     if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
-      log_d("Failed to create file content");
+      log_e("Failed to create file content");
       return;
     }
 
     JsonArray feedingScheduleObj = feedingScheduleDoc.to<JsonArray>();
 
     if (!fileHandler.writeJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleObj)) {
-      log_d("Failed to write to file");
+      log_e("Failed to write to file");
       return;
     }
   }
 
   if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-    log_d("Failed to read file content");
+    log_e("Failed to read file content");
     return;
   }
 
   if (!SPIFFS.exists(URL_LIST_FILE_PATH)) {
     if (!fileHandler.createFile(URL_LIST_FILE_PATH)) {
-      log_d("Failed to create file content");
+      log_e("Failed to create file content");
       return;
     }
 
@@ -245,19 +266,19 @@ void setup() {
     urlListObj["mqttUrl"] = "";
 
     if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListObj)) {
-      log_d("Failed to write to file");
+      log_e("Failed to write to file");
       return;
     }
   }
 
   if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    log_d("Failed to read url file");
+    log_e("Failed to read url file");
     return;
   }
 
   if (!SPIFFS.exists(TZ_FILE_PATH)) {
     if (!fileHandler.createFile(TZ_FILE_PATH)) {
-      log_d("Failed to create file content");
+      log_e("Failed to create file content");
       return;
     }
 
@@ -265,15 +286,36 @@ void setup() {
     tzObj["tz"] = "UTC0";
 
     if (!fileHandler.writeJson(TZ_FILE_PATH, tzObj)) {
-      log_d("Failed to write to file");
+      log_e("Failed to write to file");
       return;
     }
   }
 
   if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)) {
-    log_d("Failed to read url file");
+    log_e("Failed to read url file");
     return;
-  }  
+  }
+
+  if (!SPIFFS.exists(WIFI_CRED_FILE_PATH)) {
+    if (!fileHandler.createFile(TZ_FILE_PATH)) {
+      log_e("Failed to create file content");
+      return;
+    }
+
+    JsonObject wifiObj = wifiCredentialsDoc.to<JsonObject>();
+    wifiObj["ssid"] = "";
+    wifiObj["password"] = "";
+
+    if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiObj)) {
+      log_e("Failed to write to file");
+      return;
+    }
+  }
+
+  if (!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
+    log_e("Failed to read url file");
+    return;
+  }
   
   File root = SPIFFS.open("/");
   if(!root){
@@ -306,18 +348,23 @@ void setup() {
   // Init WiFi
   WiFi.mode(WIFI_AP_STA);
   WiFi.onEvent(WiFiEvent);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
   WiFi.softAP(AP_SSID, AP_PASS);
+
+  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
+    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+  }
 
   digitalWrite(LED_BUILTIN, HIGH);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(1500);
+  // while (WiFi.status() != WL_CONNECTED) {
+  //   digitalWrite(LED_BUILTIN, LOW);
+  //   delay(1500);
 
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(1500);
-  }
+  //   digitalWrite(LED_BUILTIN, HIGH);
+  //   delay(1500);
+  // }
+
+  // printScannedWifi();
 
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -545,17 +592,10 @@ void setup() {
 
         return;
       }
-      
-      if (!json.containsKey("status")) {
-        json["status"] = 0;
-      }
 
       feedingScheduleDoc[id - 1]["hour"] = json["hour"];
       feedingScheduleDoc[id - 1]["minutes"] = json["minutes"];
       feedingScheduleDoc[id - 1]["seconds"] = json["seconds"];
-      feedingScheduleDoc[id - 1]["status"] = json["status"];
-
-      feedingScheduleDoc.garbageCollect();
     } else {
       if (feedingScheduleSize > 5) {
         request->send(403, "application/json", "{\"message\": \"maximum capacity of feeding schedules\"}\n");
@@ -563,8 +603,6 @@ void setup() {
 
         return;
       }
-
-      json["status"] = 0;
 
       if (!feedingScheduleDoc.add(json.as<JsonObject>())) {
         request->send(500, "application/json", "{\"message\": \"failed adding data to variable\"}\n");
@@ -679,11 +717,61 @@ void setup() {
     xSemaphoreGive(tzFileMutex);
   });
 
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, WIFI_CRED_FILE_PATH, "application/json");
+  });
+
+  AsyncCallbackJsonWebHandler* wifiPostHandler = 
+  new AsyncCallbackJsonWebHandler("/wifi", [](AsyncWebServerRequest* request, JsonVariant &json) {
+    if (json.is<JsonArray>()) {
+      request->send(400, "application/json", "{\"message\": \"invalid request\"}\n");
+      return;
+    }
+
+    if (xSemaphoreTake(wifiFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+
+      return;
+    }
+
+    if (!json.containsKey("ssid")) {
+      request->send(400, "application/json", "{\"message\": \"missing ssid field\"}\n");
+      xSemaphoreGive(wifiFileMutex);      
+
+      return;
+    }
+
+    FileHandler fileHandler(SPIFFS);
+
+    if(!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(wifiFileMutex);
+
+      return;
+    }
+
+    wifiCredentialsDoc["ssid"] = json["ssid"];
+    if (json.containsKey("password"))
+      wifiCredentialsDoc["password"] = json["password"];
+    
+    if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+      xSemaphoreGive(wifiFileMutex);
+
+      return;
+    }
+
+    request->send(201);
+    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+    xSemaphoreGive(wifiFileMutex);
+  });
+
   ws.onEvent(onEvent);
 
   server.addHandler(&ws);
   server.addHandler(feedingSchedulePostHandler);
   server.addHandler(urlListPostHandler);
+  server.addHandler(wifiPostHandler);
 
   server.begin();
 
@@ -727,6 +815,11 @@ void printLocalTime() {
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    return;
+  }
+  
   struct tm timeinfo;
 
   log_d("Getting local time");
@@ -738,7 +831,9 @@ void loop() {
 
   if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr && 
       xSemaphoreGetMutexHolder(urlFileMutex) == nullptr &&
-      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr) {
+      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr && 
+      xSemaphoreGetMutexHolder(wifiFileMutex) == nullptr) {
+
     if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
       return;
     }
@@ -749,16 +844,12 @@ void loop() {
 
     JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
     for (JsonVariant v : arrDoc) {
-      if(v["status"].as<bool>() == true) {
-        log_d("Status is true");
-        continue;
-      }
-
       log_d("compare time: %d:%d | %d:%d", v["hour"].as<int>(), v["minutes"].as<int>(), timeinfo.tm_hour, timeinfo.tm_min);
+
       if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
         String url = urlListDoc["aiUrl"].as<String>();
         if (url == nullptr || url == "") {
-          log_d("AI URL is empty");          
+          log_w("AI URL is empty");          
           return;
         }
 
@@ -767,7 +858,7 @@ void loop() {
 
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) {
-          log_d("Failed at getting camera framebuffer");
+          log_e("Failed at getting camera framebuffer");
           continue;
         }
 
