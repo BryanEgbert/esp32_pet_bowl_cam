@@ -9,7 +9,7 @@
 #include <AsyncJson.h>
 #include <FileHandler.hpp>
 #include <Base64.h>
-
+#include <ESP32Servo.h>
 
 #include "credentials.hpp"
 #include "freertos/FreeRTOS.h"
@@ -18,6 +18,7 @@
 #include "time.h"
 
 #define LED_BUILTIN     33
+
 #define SERVO_PIN       14
 
 #define Y2_GPIO_NUM     5
@@ -43,7 +44,11 @@ SemaphoreHandle_t endpointMutex,
                   feedingScheduleMutex, 
                   urlFileMutex, 
                   tzFileMutex,
-                  wifiFileMutex;
+                  wifiFileMutex,
+                  notifyFileMutex,
+                  servoConfigMutex;
+
+Servo servo;
 
 FileHandler fileHandler(SPIFFS);
 
@@ -53,8 +58,10 @@ String nonce = "test";
 DynamicJsonDocument feedingScheduleDoc(384);
 DynamicJsonDocument urlListDoc(192);
 DynamicJsonDocument httpPredictionResponseDoc(192);
+DynamicJsonDocument servoConfigDoc(96);
 DynamicJsonDocument tzDoc(64);
 DynamicJsonDocument wifiCredentialsDoc(128);
+DynamicJsonDocument weightDoc(48);
 
 bool isProcessed = false;
 
@@ -62,6 +69,8 @@ const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
 const char* URL_LIST_FILE_PATH = "/url_list.json";
 const char* TZ_FILE_PATH = "/timezone.json";
 const char* WIFI_CRED_FILE_PATH = "/wifi_cred.json";
+const char* NOTIFY_FILE_PATH = "/notify_config.json";
+const char* SERVO_CONFIG_FILE_PATH = "/servo_config.json";
 
 void printLocalTime();
 
@@ -76,32 +85,23 @@ void printScannedWifi() {
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
     client->printf("Hello client %u | There are currently %u client(s)\n", client->id(), ws.count());
-    Serial.printf("Hello client %u | There are currently %u client(s)\n", client->id(), ws.count());
+    log_d("client %u connected | There are currently %u client(s)\n", client->id(), ws.count());
   } else if(type == WS_EVT_DISCONNECT){
-    //client disconnected
-    Serial.printf("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
+    log_d("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
   } else if(type == WS_EVT_DATA) {
     AwsFrameInfo * info = (AwsFrameInfo*)arg;
 
     if(info->final && info->index == 0 && info->len == len) {
-      Serial.printf("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT)?"text":"binary", info->len);
+      log_d("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text":"binary", info->len);
 
       if (info->opcode == WS_TEXT) {
         data[len] = 0;
-        // Serial.printf("%s\n", (char*)data);
         if (String((char*)data) == String("request_image")) {
           camera_fb_t* fb = esp_camera_fb_get();
     
           client->binary(fb->buf, fb->len);
           esp_camera_fb_return(fb);
         }
-      } else {
-        for(size_t i=0; i < info ->len; i++){
-          Serial.printf("%02x ", data[i]);
-        }
-          Serial.print("\n");
-
-          client->binary("I gotchu binary\n");
       }
     }
   }
@@ -113,128 +113,166 @@ void WiFiEvent(WiFiEvent_t event) {
       WiFi.softAPsetHostname("ESP32CAM_PetBowlCam");
       WiFi.softAPenableIpV6();
 
-      Serial.print("AP IPv4: ");
-      Serial.println(WiFi.softAPIP());
-      break;
-
-    case ARDUINO_EVENT_WIFI_STA_START:
-      WiFi.setHostname("RumahCs_KM");
+      log_d("AP IPv4: %s\n", WiFi.softAPIP());
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      //enable sta ipv6 here
       WiFi.enableIpV6();
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
-      Serial.print("STA IPv6: ");
-      Serial.println(WiFi.localIPv6());
+      log_d("STA IPv6: %s", WiFi.localIPv6());
       break;
     case ARDUINO_EVENT_WIFI_AP_GOT_IP6:
-      Serial.print("AP IPv6: ");
-      Serial.println(WiFi.softAPIPv6());
+      log_d("AP IPv6: %s", WiFi.softAPIPv6());
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.print("STA Connected | IPv4: ");
-      Serial.println(WiFi.localIP());
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.println("WiFi Disconnected");
+      log_d("STA IPv4: %s", WiFi.localIP());
       break;
     default:
       break;
   }
 }
 
-void feedTask(void *pvParameters) {
+void simpleTask(void *pvParameters) {
   (void) pvParameters;
-  struct tm timeinfo;
 
   pinMode(LED_BUILTIN, OUTPUT);
 
   digitalWrite(LED_BUILTIN, HIGH);
+  // for (int pos = 0; pos <= 180; pos++) {
+  //   servo.write(pos);
+  //   delay(15);
+  // }
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-  while (true) {
-    if(!getLocalTime(&timeinfo)){
-      continue;
-    }
+  digitalWrite(LED_BUILTIN, LOW);
+  // for (int pos = 180; pos >= 0; pos--) {
+  //   servo.write(pos); 
+  // }
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-    if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr) {
-      vTaskDelay(500 / portTICK_PERIOD_MS);
-      digitalWrite(LED_BUILTIN, LOW);
-
-      vTaskDelay(500 / portTICK_PERIOD_MS);
-      digitalWrite(LED_BUILTIN, HIGH);
-
-      JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
-      for (JsonVariant v : arrDoc) {
-        if(v["status"].as<bool>() == true) {
-          continue;
-        }
-
-
-        // if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
-        //   int retries = 0;
-        //   HTTPClient http;
-
-        //   // camera_fb_t* fb = esp_camera_fb_get();
-        //   // if (!fb) {
-        //   //   continue;
-        //   // }
-
-        //   http.begin("https://google.com");
-        //   // int httpCode = http.POST(fb->buf, fb->len);
-        //   int httpCode = http.GET();
-
-        //   // if (httpCode != HTTP_CODE_OK) {
-        //   //   retries++;
-        //   //   log_d("retries: %d", retries);
-        //   // }
-        //   // while (retries < 5) {
-        //   // }
-
-        //   // esp_camera_fb_return(fb);
-        //   http.end();
-        // }
-      }
-
-      vTaskDelay(5000 / portTICK_PERIOD_MS);
-    } else {
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-
-  }
 }
 
-/* TODO: Add json file to store
-*   - WiFi STA credentials
-*   - Servo open in milliseconds
-*   - Weight sensor value to notify through MQTT
-*   - Servo should open if ai server is not available (timed out / max retries)
-*   - Handle ai server output, update status to true
-*/
-void setup() {
+void initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 2000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
 
-  Serial.begin(115200);
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
 
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    ESP.restart();
+  }
+
+  sensor_t* sensor = esp_camera_sensor_get();
+  if (sensor->id.PID == OV3660_PID) {
+    sensor->set_vflip(sensor, 1);
+    sensor->set_brightness(sensor, 1);
+    sensor->set_saturation(sensor, -2);
+  }
+  sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+}
+
+void initServo() {
+  ESP32PWM::allocateTimer(0);
+	ESP32PWM::allocateTimer(1);
+	ESP32PWM::allocateTimer(2);
+	ESP32PWM::allocateTimer(3);
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 1000, 2000);
+}
+
+void initMutex() {
   endpointMutex = xSemaphoreCreateMutex();
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
   tzFileMutex = xSemaphoreCreateMutex();
   wifiFileMutex = xSemaphoreCreateMutex();
+  notifyFileMutex = xSemaphoreCreateMutex();
+  servoConfigMutex = xSemaphoreCreateMutex();
+
 
   if (feedingScheduleMutex == nullptr || 
-      urlFileMutex == nullptr || 
-      tzFileMutex == nullptr ||
-      wifiFileMutex == nullptr) {
+      urlFileMutex == nullptr         || 
+      tzFileMutex == nullptr          ||
+      wifiFileMutex == nullptr        ||
+      notifyFileMutex == nullptr      ||
+      servoConfigMutex == nullptr) {
     log_e("Error initializing mutex, restarting...");
     ESP.restart();
   }
+}
+
+void listDir() {
+  File root = SPIFFS.open("/");
+  if(!root){
+      Serial.println("- failed to open directory");
+      return;
+  }
+  if(!root.isDirectory()){
+      Serial.println(" - not a directory");
+      return;
+  }
+
+  File file = root.openNextFile();
+  while(file){
+    if(file.isDirectory()){
+        Serial.print("  DIR : ");
+        Serial.println(file.name());
+    } else {
+        Serial.print("  FILE: ");
+        Serial.print(file.name());
+        Serial.print("\tSIZE: ");
+        Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+/* TODO: Add json file to store
+*   - Weight sensor value to notify through MQTT
+*   - Handle ai server output
+*/
+void setup() {
+
+  Serial.begin(115200);
+
+  initServo();
+  initMutex();
   
   if (!SPIFFS.begin(true)) {
     Serial.println("Error mounting spiffs");
     return;
   }
-
-  SPIFFS.remove(FEEDING_SCHEDULE_FILE_PATH);
 
   if (!SPIFFS.exists(FEEDING_SCHEDULE_FILE_PATH)) {
     if (!fileHandler.createFile(FEEDING_SCHEDULE_FILE_PATH)) {
@@ -297,7 +335,7 @@ void setup() {
   }
 
   if (!SPIFFS.exists(WIFI_CRED_FILE_PATH)) {
-    if (!fileHandler.createFile(TZ_FILE_PATH)) {
+    if (!fileHandler.createFile(WIFI_CRED_FILE_PATH)) {
       log_e("Failed to create file content");
       return;
     }
@@ -316,31 +354,49 @@ void setup() {
     log_e("Failed to read url file");
     return;
   }
-  
-  File root = SPIFFS.open("/");
-  if(!root){
-      Serial.println("- failed to open directory");
-      return;
-  }
-  if(!root.isDirectory()){
-      Serial.println(" - not a directory");
-      return;
-  }
 
-  File file = root.openNextFile();
-  while(file){
-    if(file.isDirectory()){
-        Serial.print("  DIR : ");
-        Serial.println(file.name());
-    } else {
-        Serial.print("  FILE: ");
-        Serial.print(file.name());
-        Serial.print("\tSIZE: ");
-        Serial.println(file.size());
+  if (!SPIFFS.exists(NOTIFY_FILE_PATH)) {
+    if (!fileHandler.createFile(NOTIFY_FILE_PATH)) {
+      log_e("Failed to create file content");
+      return;
     }
-    file = root.openNextFile();
-  } 
 
+    JsonObject weightObj = weightDoc.to<JsonObject>();
+    weightObj["weightToNotify"] = 0;
+
+    if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightObj)) {
+      log_e("Failed to write to file");
+      return;
+    }
+  }
+
+  if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)) {
+    log_e("Failed to read url file");
+    return;
+  }
+
+  if (!SPIFFS.exists(SERVO_CONFIG_FILE_PATH)) {
+    if (!fileHandler.createFile(SERVO_CONFIG_FILE_PATH)) {
+      log_e("Failed to create file content");
+      return;
+    }
+
+    JsonObject servoConfigObj = servoConfigDoc.to<JsonObject>();
+    servoConfigDoc["servoOpenMs"] = 0;
+    servoConfigDoc["shouldOpenIfTimeout"] = true;
+
+    if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+      log_e("Failed to write to file");
+      return;
+    }
+  }
+
+  if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+    log_e("Failed to read url file");
+    return;
+  }
+
+  listDir();
   psramInit();
 
   byte* psdRamBuffer = (byte*)ps_malloc(1024 * 1024 * 4);
@@ -354,68 +410,13 @@ void setup() {
     WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
   }
 
-  digitalWrite(LED_BUILTIN, HIGH);
-
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   digitalWrite(LED_BUILTIN, LOW);
-  //   delay(1500);
-
-  //   digitalWrite(LED_BUILTIN, HIGH);
-  //   delay(1500);
-  // }
-
+  // digitalWrite(LED_BUILTIN, HIGH);
   // printScannedWifi();
 
-  digitalWrite(LED_BUILTIN, LOW);
+  // digitalWrite(LED_BUILTIN, LOW);
 
   // Init Camera
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 2000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    ESP.restart();
-  }
-
-  sensor_t* sensor = esp_camera_sensor_get();
-  if (sensor->id.PID == OV3660_PID) {
-    sensor->set_vflip(sensor, 1);
-    sensor->set_brightness(sensor, 1);
-    sensor->set_saturation(sensor, -2);
-  }
-  sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+  initCamera();
 
   // Init server
   // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -722,7 +723,7 @@ void setup() {
   });
 
   AsyncCallbackJsonWebHandler* wifiPostHandler = 
-  new AsyncCallbackJsonWebHandler("/wifi", [](AsyncWebServerRequest* request, JsonVariant &json) {
+    new AsyncCallbackJsonWebHandler("/wifi", [](AsyncWebServerRequest* request, JsonVariant &json) {
     if (json.is<JsonArray>()) {
       request->send(400, "application/json", "{\"message\": \"invalid request\"}\n");
       return;
@@ -766,6 +767,113 @@ void setup() {
     xSemaphoreGive(wifiFileMutex);
   });
 
+  server.on("/notify/setting", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, NOTIFY_FILE_PATH, "application/json");
+  });
+
+  server.on("/notify/setting", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("weightToNotify", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing tz field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(notifyFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+      xSemaphoreGive(notifyFileMutex);
+
+      return;
+    }
+
+    FileHandler fileHandler(SPIFFS);
+
+    if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)){
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(notifyFileMutex);
+
+      return;
+    }
+
+    AsyncWebParameter* weightToNotifyParam = request->getParam("weightToNotify", true);
+    long weightToNotify = weightToNotifyParam->value().toInt();
+    if (weightToNotify < 0) {
+      request->send(400, "application/json", "{\"message\": \"value must be a positive number\"}");
+      xSemaphoreGive(notifyFileMutex);
+
+      return;
+    }
+
+    weightDoc["weightToNotify"] = weightToNotify;
+
+    if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+      xSemaphoreGive(notifyFileMutex);
+
+      return;
+    }
+
+    request->send(204);
+    xSemaphoreGive(notifyFileMutex);
+  });
+
+  server.on("/servo", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
+  });
+
+  server.on("/servo", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("shouldOpenIfTimeout", true) || !request->hasParam("servoOpenMs", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing required field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(servoConfigMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    FileHandler fileHandler(SPIFFS);
+
+    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)){
+      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    AsyncWebParameter* shouldOpenIfTimeoutParam = request->getParam("shouldOpenIfTimeout", true);
+    AsyncWebParameter* servoOpenMsParam = request->getParam("servoOpenMs", true);
+
+    if (shouldOpenIfTimeoutParam->value() != "true" && shouldOpenIfTimeoutParam->value() != "false" ) {
+      request->send(400, "application/json", "{\"message\": \"shouldOpenIfTimeout param should be either true or false\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    bool shouldOpenIfTimeout = (shouldOpenIfTimeoutParam->value() == "true") ? true : false;
+    long servoOpenMs = servoOpenMsParam->value().toInt();
+    if (servoOpenMs < 0) {
+      request->send(400, "application/json", "{\"message\": \"servoOpenMs parameter value should be a positive number\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    servoConfigDoc["shouldOpenIfTimeout"] = shouldOpenIfTimeout;
+    servoConfigDoc["servoOpenMs"] = servoOpenMs;
+
+    if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    request->send(204);
+    xSemaphoreGive(servoConfigMutex);
+  });
+
   ws.onEvent(onEvent);
 
   server.addHandler(&ws);
@@ -778,6 +886,8 @@ void setup() {
   configTime(0, 0, ntpServer);
   setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
   tzset();
+
+  // xTaskCreate(simpleTask, "simpleTask", 512, nullptr, 2, nullptr);
 }
 
 void printLocalTime() {
@@ -825,20 +935,25 @@ void loop() {
   log_d("Getting local time");
   if(!getLocalTime(&timeinfo)){
     return;
-  } else {
-    log_d("Successfully fetch local time");
   }
 
+  log_d("Successfully fetch local time");
+
   if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr && 
-      xSemaphoreGetMutexHolder(urlFileMutex) == nullptr &&
-      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr && 
-      xSemaphoreGetMutexHolder(wifiFileMutex) == nullptr) {
+      xSemaphoreGetMutexHolder(urlFileMutex) == nullptr         &&
+      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr          && 
+      xSemaphoreGetMutexHolder(wifiFileMutex) == nullptr        &&
+      xSemaphoreGetMutexHolder(servoConfigMutex) == nullptr) {
 
     if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
       return;
     }
 
     if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+      return;
+    }
+
+    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
       return;
     }
 
@@ -893,12 +1008,49 @@ void loop() {
           }
         }
 
-        log_d("Getting response body");
-        String payload = http.getString();
-        log_d("length: %d", payload.length());
+        if (retries < 5) {
+          log_d("Getting response body");
+          String payload = http.getString();
+          log_d("length: %d", payload.length());
 
-        deserializeJson(httpPredictionResponseDoc, payload);
-        serializeJson(httpPredictionResponseDoc, Serial);
+          deserializeJson(httpPredictionResponseDoc, payload);
+          serializeJson(httpPredictionResponseDoc, Serial);
+
+          if (httpPredictionResponseDoc["top"].as<String>() != "full_bowl" && httpPredictionResponseDoc["top"].as<String>() != "floor") {
+            // TODO: Handle response and logic to open servo
+            log_d("Opening servo");
+            for (int pos = 0; pos <= 180; pos++) {
+              servo.write(pos);
+              delay(15);
+            }
+  
+            delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+  
+  
+            log_d("Closing servo");
+            for (int pos = 180; pos >= 0; pos--) {
+              servo.write(pos);
+              delay(15);
+            }
+          }
+        } else {
+          if (servoConfigDoc["shouldOpenIfTimeout"].as<bool>()) {
+            log_d("Opening servo");
+            for (int pos = 0; pos <= 180; pos++) {
+              servo.write(pos);
+              delay(15);
+            }
+
+            delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+
+
+            log_d("Closing servo");
+            for (int pos = 180; pos >= 0; pos--) {
+              servo.write(pos);
+              delay(15);
+            }
+          }
+        }
 
         http.end();
         log_d("HTTPClient end() called");
@@ -912,31 +1064,4 @@ void loop() {
   } else {
     delay(1000);
   }
-  // // put your main code here, to run repeatedly:
-  // digitalWrite(LED_BUILTIN, HIGH);
-
-  // delay(2000);
-
-  // // if(WiFi.status() == WL_CONNECTED) {
-  // //   http.begin
-  // // }
-
-  // // printLocalTime();
-  // digitalWrite(LED_BUILTIN, LOW);
-
-  // delay(5000);
-
-  // JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
-  // for (JsonVariant value : arrDoc) {
-  //   // Access individual elements using the [] operator
-  //   int hour = value["hour"];
-  //   int minutes = value["minutes"];
-  //   int seconds = value["seconds"];
-  //   int status = value["status"];
-
-  //   // Print the values using Serial.printf
-  //   Serial.printf("Hour: %d, Minutes: %d, Seconds: %d, Status: %d\n", hour, minutes, seconds, status);
-  // }
-
-  // delay(5000);
 }
