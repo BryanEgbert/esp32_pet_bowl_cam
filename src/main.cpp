@@ -49,7 +49,6 @@ SemaphoreHandle_t endpointMutex,
                   servoConfigMutex;
 
 Servo servo;
-
 FileHandler fileHandler(SPIFFS);
 
 const char* ntpServer = "pool.ntp.org";
@@ -142,13 +141,13 @@ void simpleTask(void *pvParameters) {
   //   servo.write(pos);
   //   delay(15);
   // }
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
 
   digitalWrite(LED_BUILTIN, LOW);
   // for (int pos = 180; pos >= 0; pos--) {
   //   servo.write(pos); 
   // }
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
 
 }
 
@@ -887,7 +886,10 @@ void setup() {
   setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
   tzset();
 
-  // xTaskCreate(simpleTask, "simpleTask", 512, nullptr, 2, nullptr);
+  // BaseType_t xReturned = xTaskCreate(simpleTask, "simpleTask", 512, nullptr, 2, nullptr);
+  // if (xReturned == pdPASS) log_d("Successfully create task");
+  // else log_d("Failed creating task");
+  // vTaskStartScheduler();
 }
 
 void printLocalTime() {
@@ -987,15 +989,19 @@ void loop() {
         esp_camera_fb_return(fb);
         log_d("Deallocate camera framebuffer");
 
-        String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        // String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        // reqBody += encodedString;
+        // reqBody += "\r\n--camBoundary--\r\n";
+        String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"\r\n\r\n";
         reqBody += encodedString;
         reqBody += "\r\n--camBoundary--\r\n";
 
         log_d("start POST request");
 
-        http.setTimeout(1000);
+        http.setTimeout(10000);
         http.begin(url.c_str());
         http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
+        http.addHeader("Content-Length", String(reqBody.length()));
         http.addHeader("accept", "application/json");
 
         int httpCode = http.POST(reqBody);
@@ -1004,7 +1010,11 @@ void loop() {
         if (httpCode != HTTP_CODE_OK) {
           while (retries < 5) {
             retries++;
+            delay(500);
+
             httpCode = http.POST(reqBody);
+            if (httpCode == HTTP_CODE_OK)
+              break;
           }
         }
 
@@ -1019,36 +1029,36 @@ void loop() {
           if (httpPredictionResponseDoc["top"].as<String>() != "full_bowl" && httpPredictionResponseDoc["top"].as<String>() != "floor") {
             // TODO: Handle response and logic to open servo
             log_d("Opening servo");
-            for (int pos = 0; pos <= 180; pos++) {
-              servo.write(pos);
-              delay(15);
-            }
+            // for (int pos = 0; pos <= 180; pos++) {
+            //   servo.write(pos);
+            //   delay(15);
+            // }
   
             delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
   
   
             log_d("Closing servo");
-            for (int pos = 180; pos >= 0; pos--) {
-              servo.write(pos);
-              delay(15);
-            }
+            // for (int pos = 180; pos >= 0; pos--) {
+              // servo.write(pos);
+              // delay(15);
+            // }
           }
         } else {
           if (servoConfigDoc["shouldOpenIfTimeout"].as<bool>()) {
             log_d("Opening servo");
-            for (int pos = 0; pos <= 180; pos++) {
-              servo.write(pos);
-              delay(15);
-            }
+            // for (int pos = 0; pos <= 180; pos++) {
+              // servo.write(pos);
+              // delay(15);
+            // }
 
             delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
 
 
             log_d("Closing servo");
-            for (int pos = 180; pos >= 0; pos--) {
-              servo.write(pos);
-              delay(15);
-            }
+            // for (int pos = 180; pos >= 0; pos--) {
+              // servo.write(pos);
+              // delay(15);
+            // }
           }
         }
 
