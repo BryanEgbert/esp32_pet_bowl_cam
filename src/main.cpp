@@ -10,6 +10,7 @@
 #include <FileHandler.hpp>
 #include <Base64.h>
 #include <ESP32Servo.h>
+#include <Update.h>
 
 #include "credentials.hpp"
 #include "freertos/FreeRTOS.h"
@@ -40,8 +41,7 @@
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-SemaphoreHandle_t endpointMutex, 
-                  feedingScheduleMutex, 
+SemaphoreHandle_t feedingScheduleMutex, 
                   urlFileMutex, 
                   tzFileMutex,
                   wifiFileMutex,
@@ -52,7 +52,6 @@ Servo servo;
 FileHandler fileHandler(SPIFFS);
 
 const char* ntpServer = "pool.ntp.org";
-String nonce = "test";
 
 DynamicJsonDocument feedingScheduleDoc(384);
 DynamicJsonDocument urlListDoc(192);
@@ -62,8 +61,6 @@ DynamicJsonDocument tzDoc(64);
 DynamicJsonDocument wifiCredentialsDoc(128);
 DynamicJsonDocument weightDoc(48);
 
-bool isProcessed = false;
-
 const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
 const char* URL_LIST_FILE_PATH = "/url_list.json";
 const char* TZ_FILE_PATH = "/timezone.json";
@@ -71,7 +68,23 @@ const char* WIFI_CRED_FILE_PATH = "/wifi_cred.json";
 const char* NOTIFY_FILE_PATH = "/notify_config.json";
 const char* SERVO_CONFIG_FILE_PATH = "/servo_config.json";
 
-void printLocalTime();
+unsigned long currentMillis = 0;
+
+void openServo(int delayMs) {
+  log_d("Opening servo");
+  for (int pos = 0; pos <= 180; pos++) {
+    servo.write(pos);
+  }
+
+  log_d("Done opening servo");
+  delay(delayMs);
+
+  log_d("Closing servo");
+  for (int pos = 180; pos >= 0; pos--) {
+    servo.write(pos);
+  }
+  log_d("Done closing servo");
+}
 
 void printScannedWifi() {
   int numNetworks = WiFi.scanNetworks();
@@ -81,10 +94,43 @@ void printScannedWifi() {
   }
 }
 
+// void initArduinoOTA() {
+//   log_d("initialize Arduino OTA");
+
+//   ArduinoOTA
+//     .onStart([]() {
+//       String type;
+//       if (ArduinoOTA.getCommand() == U_FLASH)
+//         type = "sketch";
+//       else // U_SPIFFS
+//         type = "filesystem";
+
+//       // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+//       log_i("Start updating %s", type);
+//     })
+//     .onEnd([]() {
+//       log_i("\nUpdate finished");
+//     })
+//     .onProgress([](unsigned int progress, unsigned int total) {
+//       log_i("Progress: %u total: %u\r", progress, total);
+//     })
+//     .onError([](ota_error_t error) {
+//       log_i("Error[%u]: ", error);
+//       if (error == OTA_AUTH_ERROR) log_i("Auth Failed");
+//       else if (error == OTA_BEGIN_ERROR) log_i("Begin Failed");
+//       else if (error == OTA_CONNECT_ERROR) log_i("Connect Failed");
+//       else if (error == OTA_RECEIVE_ERROR) log_i("Receive Failed");
+//       else if (error == OTA_END_ERROR) log_i("End Failed");
+//     });
+
+//   ArduinoOTA.begin();
+
+//   log_d("finished initializing Arduino OTA");
+// }
+
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
     client->printf("Hello client %u | There are currently %u client(s)\n", client->id(), ws.count());
-    log_d("client %u connected | There are currently %u client(s)\n", client->id(), ws.count());
   } else if(type == WS_EVT_DISCONNECT){
     log_d("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
   } else if(type == WS_EVT_DATA) {
@@ -112,44 +158,23 @@ void WiFiEvent(WiFiEvent_t event) {
       WiFi.softAPsetHostname("ESP32CAM_PetBowlCam");
       WiFi.softAPenableIpV6();
 
-      log_d("AP IPv4: %s\n", WiFi.softAPIP());
+      // initArduinoOTA();
+      // ArduinoOTA.setTimeout(2000);
+      
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       WiFi.enableIpV6();
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
-      log_d("STA IPv6: %s", WiFi.localIPv6());
-      break;
-    case ARDUINO_EVENT_WIFI_AP_GOT_IP6:
-      log_d("AP IPv6: %s", WiFi.softAPIPv6());
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      log_d("STA IPv4: %s", WiFi.localIP());
+
       break;
     default:
       break;
   }
 }
 
-void simpleTask(void *pvParameters) {
-  (void) pvParameters;
-
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  digitalWrite(LED_BUILTIN, HIGH);
-  // for (int pos = 0; pos <= 180; pos++) {
-  //   servo.write(pos);
-  //   delay(15);
-  // }
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
-
-  digitalWrite(LED_BUILTIN, LOW);
-  // for (int pos = 180; pos >= 0; pos--) {
-  //   servo.write(pos); 
-  // }
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
-
-}
+// void arduinoUpdater(void *pvParameters) {
+//   (void) pvParameters;
+//   // ArduinoOTA.handle();
+// }
 
 void initCamera() {
   camera_config_t config;
@@ -198,7 +223,7 @@ void initCamera() {
     sensor->set_brightness(sensor, 1);
     sensor->set_saturation(sensor, -2);
   }
-  sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+  sensor->set_framesize(sensor, FRAMESIZE_240X240);
 }
 
 void initServo() {
@@ -210,8 +235,14 @@ void initServo() {
   servo.attach(SERVO_PIN, 1000, 2000);
 }
 
+void initTimezone() {
+  configTime(0, 0, ntpServer);
+  setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
+  tzset();
+}
+
 void initMutex() {
-  endpointMutex = xSemaphoreCreateMutex();
+  // endpointMutex = xSemaphoreCreateMutex();
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
   tzFileMutex = xSemaphoreCreateMutex();
@@ -264,6 +295,9 @@ void listDir() {
 void setup() {
 
   Serial.begin(115200);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   initServo();
   initMutex();
@@ -400,22 +434,12 @@ void setup() {
 
   byte* psdRamBuffer = (byte*)ps_malloc(1024 * 1024 * 4);
 
-  // Init WiFi
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.onEvent(WiFiEvent);
-  WiFi.softAP(AP_SSID, AP_PASS);
-
-  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
-    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
-  }
-
-  // digitalWrite(LED_BUILTIN, HIGH);
-  // printScannedWifi();
-
-  // digitalWrite(LED_BUILTIN, LOW);
-
   // Init Camera
   initCamera();
+
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+    log_d("not enough space");
+  }
 
   // Init server
   // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -435,46 +459,6 @@ void setup() {
 
   //   request->send(response);
   // });
-
-  server.on("/prediction", HTTP_POST, [](AsyncWebServerRequest* request) {
-    if (xSemaphoreTake(endpointMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "max client allowed");
-
-      return;
-    }
-
-    if (request->hasParam("prediction", true) || request->hasParam("servoOpenSeconds", true) || request->hasParam("nonce", true)) {
-      AsyncWebParameter* nonceParam = request->getParam("nonce", true);
-
-      String tmp = nonceParam->value();
-
-
-      if (tmp != nonce) {
-        request->send(403, "text/plain", "Invalid nonce\n");
-        xSemaphoreGive(endpointMutex);
-
-        return;
-      }
-
-
-      AsyncWebParameter* predictionParam = request->getParam("prediction", true);
-      AsyncWebParameter* servoOpenSecondsParam = request->getParam("servoOpenSeconds", true);
-
-      nonce = "test1";
-      // Open Servo code here
-      char response[100];
-      snprintf(response, 100, "{\"message\": \"%s\",\"newNonce\": \"%s\",\"servoOpenSeconds\": \"%s\"}\n", predictionParam->value(), nonce.c_str(), servoOpenSecondsParam->value());
-
-      request->send(200, "application/json", response);
-      xSemaphoreGive(endpointMutex);
-
-      return;
-    }
-
-    xSemaphoreGive(endpointMutex);
-
-    request->send(400, "application/json", "{\"message\": \"either one of prediction or servoOpenSeconds parameter is missing\"}\n");
-  });
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, URL_LIST_FILE_PATH, "application/json");
@@ -516,38 +500,6 @@ void setup() {
     request->send(204);
     xSemaphoreGive(urlFileMutex);
   });
-
-  // server.on("/url", HTTP_PUT, [](AsyncWebServerRequest* request) {
-  //   if (!request->hasParam("url", true)) {
-  //     request->send(400, "application/json", "{\"message\": \"missing id field\"}");
-
-  //     return;
-  //   }
-
-  //   if (xSemaphoreTake(urlFileMutex, portMAX_DELAY) != pdTRUE) {
-  //     request->send(500, "text/plain", "max client allowed");
-
-  //     return; 
-  //   }
-
-  //   urlListDoc["url"] = request->getParam("url", true)->value();
-
-  //   // File file = SPIFFS.open(URL_LIST_FILE_PATH, FILE_WRITE);
-  //   // if (!file) {
-  //   //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-  //   //   file.close();
-  //   //   xSemaphoreGive(urlFileMutex);
-
-  //   //   return;
-  //   // }
-
-  //   // serializeJson(urlListDoc, file);
-  //   // file.close();
-    
-  //   // request->send(204);
-    
-  //   // xSemaphoreGive(urlFileMutex);    
-  // });
 
   server.on("/feeding_schedule", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, FEEDING_SCHEDULE_FILE_PATH, "application/json");
@@ -679,7 +631,6 @@ void setup() {
 
     if (xSemaphoreTake(tzFileMutex, portMAX_DELAY) != pdTRUE) {
       request->send(500, "text/plain", "internal server error");
-      xSemaphoreGive(tzFileMutex);
 
       return;
     }
@@ -777,8 +728,7 @@ void setup() {
     }
 
     if (xSemaphoreTake(notifyFileMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "internal server error");
-      xSemaphoreGive(notifyFileMutex);
+      request->send(500, "text/plain", "internal server error");;
 
       return;
     }
@@ -814,6 +764,28 @@ void setup() {
     xSemaphoreGive(notifyFileMutex);
   });
 
+  server.on("/servo/open", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (xSemaphoreTake(servoConfigMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "application/json", "{\"message\": \"servo is in use by the esp32\"}");
+
+      return;
+    }
+
+    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+      request->send(500, "application/json", "{\"message\": \"failed to read from file\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
+
+    // unsigned int delayMs = servoConfigDoc["servoOpenMs"].as<unsigned int>();
+
+    openServo(request->getParam("delay", true)->value().toInt());
+
+    request->send(200, "application/json", "{\"message\": \"success\"}");
+    xSemaphoreGive(servoConfigMutex);
+  });
+
   server.on("/servo", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
   });
@@ -826,7 +798,6 @@ void setup() {
 
     if (xSemaphoreTake(servoConfigMutex, portMAX_DELAY) != pdTRUE) {
       request->send(500, "text/plain", "internal server error");
-      xSemaphoreGive(servoConfigMutex);
 
       return;
     }
@@ -873,6 +844,32 @@ void setup() {
     xSemaphoreGive(servoConfigMutex);
   });
 
+  server.on("/update", HTTP_POST, [](AsyncWebServerRequest* request) {
+    AsyncWebServerResponse *response = request->beginResponse((Update.hasError()) ? 400 : 200, "text/plain", Update.hasError() ? String(Update.getError()).c_str() : "OK");
+    response->addHeader("Connection", "close");
+    response->addHeader("Access-Control-Allow-Origin", "*");
+
+    request->send(response);
+
+  }, [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+    log_d("Handling file upload, filename = %s | index = %d | len = %d | final = %d", filename, index, len, final);
+    if(len){
+      if (Update.write(data, len) != len) {
+        return request->send(400, "text/plain", "Failed to write chunked data to free space");
+      }
+    }
+        
+    if (final) {
+      if (!Update.end(true)) {
+        log_d("/update: %s", String(Update.getError()));
+      }
+
+      log_i("Update successfully completed. Please reboot your device");
+    }else{
+      return;
+    }
+  });
+
   ws.onEvent(onEvent);
 
   server.addHandler(&ws);
@@ -882,196 +879,174 @@ void setup() {
 
   server.begin();
 
-  configTime(0, 0, ntpServer);
-  setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
-  tzset();
+  initTimezone();
 
-  // BaseType_t xReturned = xTaskCreate(simpleTask, "simpleTask", 512, nullptr, 2, nullptr);
-  // if (xReturned == pdPASS) log_d("Successfully create task");
-  // else log_d("Failed creating task");
-  // vTaskStartScheduler();
-}
+  // Init WiFi
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent(WiFiEvent);
+  WiFi.softAP(AP_SSID, AP_PASS);
 
-void printLocalTime() {
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to obtain time");
+  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
+    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+  }
+
+  if (WiFi.waitForConnectResult(30000) != WL_CONNECTED) {
+    log_i("Could not connect to wifi, rebooting...");
+    ESP.restart()
+
     return;
   }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-  Serial.print("Day of week: ");
-  Serial.println(&timeinfo, "%A");
-  Serial.print("Month: ");
-  Serial.println(&timeinfo, "%B");
-  Serial.print("Day of Month: ");
-  Serial.println(&timeinfo, "%d");
-  Serial.print("Year: ");
-  Serial.println(&timeinfo, "%Y");
-  Serial.print("Hour: ");
-  Serial.println(&timeinfo, "%H");
-  Serial.print("Hour (12 hour format): ");
-  Serial.println(&timeinfo, "%I");
-  Serial.print("Minute: ");
-  Serial.println(&timeinfo, "%M");
-  Serial.print("Second: ");
-  Serial.println(&timeinfo, "%S");
 
-  Serial.println("Time variables");
-  char timeHour[3];
-  strftime(timeHour,3, "%H", &timeinfo);
-  Serial.println(timeHour);
-  char timeWeekDay[10];
-  strftime(timeWeekDay,10, "%A", &timeinfo);
-  Serial.println(timeWeekDay);
-  Serial.println();
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  log_d("setup complete 11");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    return;
-  }
-  
   struct tm timeinfo;
 
-  log_d("Getting local time");
+  if (WiFi.status() != WL_CONNECTED) return;
+
   if(!getLocalTime(&timeinfo)){
+    log_i("Failed to fetch local time");
     return;
   }
 
-  log_d("Successfully fetch local time");
+  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) != nullptr || 
+      xSemaphoreGetMutexHolder(urlFileMutex) != nullptr         ||
+      xSemaphoreGetMutexHolder(tzFileMutex) != nullptr          || 
+      xSemaphoreGetMutexHolder(wifiFileMutex) != nullptr        ||
+      xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr) {
+      
+    return;
+  }
 
-  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) == nullptr && 
-      xSemaphoreGetMutexHolder(urlFileMutex) == nullptr         &&
-      xSemaphoreGetMutexHolder(tzFileMutex) == nullptr          && 
-      xSemaphoreGetMutexHolder(wifiFileMutex) == nullptr        &&
-      xSemaphoreGetMutexHolder(servoConfigMutex) == nullptr) {
+  if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+    log_e("Failed reading feeding schedule file")
+    return;
+  }
 
-    if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-      return;
-    }
+  if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+    log_e("Failed reading url file")
+    return;
+  }
 
-    if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-      return;
-    }
+  if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+    log_e("Failed reading servo configuration file")
+    return;
+  }
 
-    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-      return;
-    }
-
-    JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
-    for (JsonVariant v : arrDoc) {
-      log_d("compare time: %d:%d | %d:%d", v["hour"].as<int>(), v["minutes"].as<int>(), timeinfo.tm_hour, timeinfo.tm_min);
-
-      if (v["hour"].as<int>() == timeinfo.tm_hour && v["minutes"].as<int>() == timeinfo.tm_min) {
-        String url = urlListDoc["aiUrl"].as<String>();
-        if (url == nullptr || url == "") {
-          log_w("AI URL is empty");          
-          return;
-        }
-
-        int retries = 0;
-        HTTPClient http;
-
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (!fb) {
-          log_e("Failed at getting camera framebuffer");
+  JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
+  for (JsonVariant v : arrDoc) {
+    if (v["hour"].as<int>() != timeinfo.tm_hour   || 
+        v["minutes"].as<int>() != timeinfo.tm_min ||
+        (millis() - currentMillis < 60000 && currentMillis != 0)) {
           continue;
-        }
+    }
+
+    log_i("Time matched: %d:%d| %d:%d", 
+      v["hour"].as<int>(), 
+      v["minutes"].as<int>(), 
+      timeinfo.tm_hour, 
+      timeinfo.tm_min
+    );
+
+    digitalWrite(LED_BUILTIN, LOW);
+
+    String url = urlListDoc["aiUrl"].as<String>();
+    if (url == nullptr || url == "") {
+      log_w("AI URL is empty");          
+      return;
+    }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      log_e("Failed at getting camera framebuffer");
+      continue;
+    }
 
 
-        int encodedLength = Base64.encodedLength(fb->len);
-        log_d("Length: %d", encodedLength);
+    int encodedLength = Base64.encodedLength(fb->len);
+    log_d("Length: %d", encodedLength);
 
-        char* encodedString = (char*)malloc(encodedLength * sizeof(char) + 1);
-        Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
+    char* encodedString = (char*)malloc(encodedLength * sizeof(char) + 1);
+    Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
 
-        esp_camera_fb_return(fb);
-        log_d("Deallocate camera framebuffer");
+    esp_camera_fb_return(fb);
+    log_d("Deallocate camera framebuffer");
 
-        // String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"; filename=\"bowl_cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-        // reqBody += encodedString;
-        // reqBody += "\r\n--camBoundary--\r\n";
-        String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"\r\n\r\n";
-        reqBody += encodedString;
-        reqBody += "\r\n--camBoundary--\r\n";
+    String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"\r\n\r\n";
+    reqBody += encodedString;
+    reqBody += "\r\n--camBoundary--\r\n";
 
-        log_d("start POST request");
+    free(encodedString);
+    log_d("Successfully deallocate base64 variable");
 
-        http.setTimeout(10000);
-        http.begin(url.c_str());
-        http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
-        http.addHeader("Content-Length", String(reqBody.length()));
-        http.addHeader("accept", "application/json");
+    log_d("start request");
 
-        int httpCode = http.POST(reqBody);
-        log_d("Status code: %d", httpCode);
+    int retries = 0;
+    HTTPClient http;
 
-        if (httpCode != HTTP_CODE_OK) {
-          while (retries < 5) {
-            retries++;
-            delay(500);
+    int httpCode = 0;
 
-            httpCode = http.POST(reqBody);
-            if (httpCode == HTTP_CODE_OK)
-              break;
-          }
-        }
+    http.begin(url.c_str());
 
-        if (retries < 5) {
-          log_d("Getting response body");
-          String payload = http.getString();
-          log_d("length: %d", payload.length());
+    http.addHeader("Content-Type", "multipart/form-data; boundary=camBoundary");
+    http.addHeader("Content-Length", String(reqBody.length()));
+    http.addHeader("accept", "application/json");
 
-          deserializeJson(httpPredictionResponseDoc, payload);
-          serializeJson(httpPredictionResponseDoc, Serial);
+    do {
+      http.setTimeout(10000);
+      http.useHTTP10(false);
+      http.setReuse(false);
 
-          if (httpPredictionResponseDoc["top"].as<String>() != "full_bowl" && httpPredictionResponseDoc["top"].as<String>() != "floor") {
-            // TODO: Handle response and logic to open servo
-            log_d("Opening servo");
-            // for (int pos = 0; pos <= 180; pos++) {
-            //   servo.write(pos);
-            //   delay(15);
-            // }
-  
-            delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
-  
-  
-            log_d("Closing servo");
-            // for (int pos = 180; pos >= 0; pos--) {
-              // servo.write(pos);
-              // delay(15);
-            // }
-          }
-        } else {
-          if (servoConfigDoc["shouldOpenIfTimeout"].as<bool>()) {
-            log_d("Opening servo");
-            // for (int pos = 0; pos <= 180; pos++) {
-              // servo.write(pos);
-              // delay(15);
-            // }
+      httpCode = http.POST(reqBody);
 
-            delay(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+      log_d("Status code: %d", httpCode);
+
+      retries++;
+    } while (retries <= 5 && httpCode != HTTP_CODE_OK);
+
+    digitalWrite(LED_BUILTIN, HIGH);
 
 
-            log_d("Closing servo");
-            // for (int pos = 180; pos >= 0; pos--) {
-              // servo.write(pos);
-              // delay(15);
-            // }
-          }
-        }
+    if (retries <= 5) {
+      log_d("Getting response body");
+      String payload = http.getString();
 
-        http.end();
-        log_d("HTTPClient end() called");
+      deserializeJson(httpPredictionResponseDoc, payload);
 
-        free(encodedString);
-        log_d("Successfully deallocate base64 variable");
+      String responseOutput = "";
+      serializeJson(httpPredictionResponseDoc, responseOutput);
+      responseOutput += '\n';
+
+      log_d("response: %s", responseOutput.c_str());
+
+      ws.textAll(responseOutput.c_str());
+      String topPrediction = httpPredictionResponseDoc["top"].as<String>();
+
+      if (topPrediction == "unfinished_bowl" || topPrediction == "empty_bowl") {
+        digitalWrite(LED_BUILTIN, LOW);
+
+        openServo(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+
+        digitalWrite(LED_BUILTIN, HIGH);
+      } else if (topPrediction == "floor") {
+        log_d("prediction is floor, ignoring");
+      }
+    } else {
+      if (servoConfigDoc["shouldOpenIfTimeout"].as<bool>()) {
+        ws.textAll("Failed to send payload");
+        
+        digitalWrite(LED_BUILTIN, LOW);
+        openServo(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+        digitalWrite(LED_BUILTIN, HIGH);
       }
     }
 
-    delay(60000);
-  } else {
-    delay(1000);
+    http.end();
+    log_d("HTTPClient end() called");
+
+    currentMillis = millis();
   }
 }
