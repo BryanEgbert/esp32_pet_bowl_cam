@@ -451,9 +451,9 @@ void setup() {
     char buffer[200];
     snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_AI_URL_KEY, 
-      preferences.getString(PREF_AI_URL_KEY), 
+      preferences.getString(PREF_AI_URL_KEY, ""), 
       PREF_MQTT_URL_KEY,
-      preferences.getString(PREF_MQTT_URL_KEY));
+      preferences.getString(PREF_MQTT_URL_KEY, ""));
 
     request->send(200, "application/json", buffer);
   });
@@ -485,14 +485,20 @@ void setup() {
     // urlListDoc["mqttUrl"] = json["mqttUrl"].as<const char*>();
 
     // if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-    //   xSemaphoreGive(urlFileMutex);
+      // request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+      // xSemaphoreGive(urlFileMutex);
 
-    //   return;
+      // return;
     // }
 
-    preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>());
-    preferences.putString(PREF_MQTT_URL_KEY, json["mqttUrl"].as<const char*>());
+    if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0  ||
+        preferences.putString(PREF_MQTT_URL_KEY, json["mqttUrl"].as<const char*>()) == 0) {
+
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
+      xSemaphoreGive(urlFileMutex);
+
+      return;
+    }
 
     request->send(204);
     xSemaphoreGive(urlFileMutex);
@@ -621,7 +627,7 @@ void setup() {
     char buffer[50];
     snprintf(buffer, 50, "{\"%s\":\"%s\"}", 
       PREF_TZ_KEY, 
-      preferences.getString(PREF_TZ_KEY)
+      preferences.getString(PREF_TZ_KEY, "")
     );
 
     request->send(200, "application/json", buffer);
@@ -665,7 +671,12 @@ void setup() {
     //   return;
     // }
 
-    preferences.putString(PREF_TZ_KEY, tzParam->value());
+    if (preferences.putString(PREF_TZ_KEY, tzParam->value()) == 0) {
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+      xSemaphoreGive(tzFileMutex);
+
+      return;
+    };
 
     setenv("TZ", tzParam->value().c_str(), 1);
     tzset();
@@ -679,9 +690,9 @@ void setup() {
     char buffer[100];
     snprintf(buffer, 100, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_WIFI_SSID_KEY, 
-      preferences.getString(PREF_WIFI_SSID_KEY),
+      preferences.getString(PREF_WIFI_SSID_KEY, ""),
       PREF_WIFI_PASS_KEY,
-      preferences.getString(PREF_WIFI_PASS_KEY)
+      preferences.getString(PREF_WIFI_PASS_KEY, "")
     );
 
     request->send(200, "application/json", buffer);
@@ -721,15 +732,26 @@ void setup() {
     //   wifiCredentialsDoc["password"] = json["password"];
     
     // if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-    //   xSemaphoreGive(wifiFileMutex);
+      // request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+      // xSemaphoreGive(wifiFileMutex);
 
-    //   return;
+      // return;
     // }
 
-    preferences.putString(PREF_WIFI_SSID_KEY, json["ssid"].as<const char*>());
+    if (preferences.putString(PREF_WIFI_SSID_KEY, json["ssid"].as<const char*>()) == 0) {
+      request->send(500, "application/json", "{\"message\": \"failed to store ssid\"}\n");
+      xSemaphoreGive(wifiFileMutex);
+
+      return;
+    }
+
     if (json.containsKey("password"))
-      preferences.putString(PREF_WIFI_PASS_KEY, json["password"].as<const char*>());
+      if (preferences.putString(PREF_WIFI_PASS_KEY, json["password"].as<const char*>()) == 0) {
+        request->send(500, "application/json", "{\"message\": \"failed to store password\"}\n");
+        xSemaphoreGive(wifiFileMutex);
+  
+        return;
+      }
 
 
     request->send(204);
@@ -809,11 +831,11 @@ void setup() {
   server.on("/servo", HTTP_GET, [](AsyncWebServerRequest* request) {
     // request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
     char buffer[60];
-    snprintf(buffer, 60, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+    snprintf(buffer, 60, "{\"%s\":%s,\"%s\":%d}", 
       PREF_OPEN_SERVO_IF_TIMEOUT_KEY, 
-      preferences.getString(PREF_OPEN_SERVO_IF_TIMEOUT_KEY),
+      preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true) ? "true" : "false",
       PREF_SERVO_OPEN_MS_KEY,
-      preferences.getString(PREF_SERVO_OPEN_MS_KEY)
+      preferences.getInt(PREF_SERVO_OPEN_MS_KEY, 0)
     );
 
     request->send(200, "application/json", buffer);
@@ -863,14 +885,20 @@ void setup() {
     // servoConfigDoc["servoOpenMs"] = servoOpenMs;
 
     // if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-    //   xSemaphoreGive(servoConfigMutex);
+      // request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+      // xSemaphoreGive(servoConfigMutex);
 
-    //   return;
+      // return;
     // }
 
-    preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout);
-    preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs);
+    if (preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout) == 0 ||
+        preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs) == 0) {
+
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+      xSemaphoreGive(servoConfigMutex);
+
+      return;
+    }
 
     request->send(204);
     xSemaphoreGive(servoConfigMutex);
@@ -934,7 +962,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   if(!getLocalTime(&timeinfo)){
-    log_i("Failed to fetch local time");
+    log_w("Failed to fetch local time");
     return;
   }
 
