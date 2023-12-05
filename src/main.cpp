@@ -11,6 +11,7 @@
 #include <Base64.h>
 #include <ESP32Servo.h>
 #include <Update.h>
+#include <Preferences.h>
 
 #include "credentials.hpp"
 #include "freertos/FreeRTOS.h"
@@ -38,6 +39,17 @@
 #define SIOC_GPIO_NUM   27
 #define PWDN_GPIO_NUM   32
 #define RESET_GPIO_NUM  -1
+
+#define PREF_OPEN_SERVO_IF_TIMEOUT_KEY  "shouldOpenIfTimeout"
+#define PREF_SERVO_OPEN_MS_KEY          "servoOpenMs"
+
+#define PREF_WIFI_SSID_KEY "ssid"
+#define PREF_WIFI_PASS_KEY "password"
+
+#define PREF_AI_URL_KEY   "aiUrl"
+#define PREF_MQTT_URL_KEY "mqttUrl"
+
+#define PREF_TZ_KEY "tz"
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -70,6 +82,8 @@ const char* SERVO_CONFIG_FILE_PATH = "/servo_config.json";
 
 unsigned long currentMillis = 0;
 
+Preferences preferences;
+
 void openServo(int delayMs) {
   log_d("Opening servo");
   for (int pos = 0; pos <= 180; pos++) {
@@ -93,40 +107,6 @@ void printScannedWifi() {
     Serial.printf(" | (%4d) | [%2d]\n", WiFi.RSSI(i), WiFi.channel(i));
   }
 }
-
-// void initArduinoOTA() {
-//   log_d("initialize Arduino OTA");
-
-//   ArduinoOTA
-//     .onStart([]() {
-//       String type;
-//       if (ArduinoOTA.getCommand() == U_FLASH)
-//         type = "sketch";
-//       else // U_SPIFFS
-//         type = "filesystem";
-
-//       // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-//       log_i("Start updating %s", type);
-//     })
-//     .onEnd([]() {
-//       log_i("\nUpdate finished");
-//     })
-//     .onProgress([](unsigned int progress, unsigned int total) {
-//       log_i("Progress: %u total: %u\r", progress, total);
-//     })
-//     .onError([](ota_error_t error) {
-//       log_i("Error[%u]: ", error);
-//       if (error == OTA_AUTH_ERROR) log_i("Auth Failed");
-//       else if (error == OTA_BEGIN_ERROR) log_i("Begin Failed");
-//       else if (error == OTA_CONNECT_ERROR) log_i("Connect Failed");
-//       else if (error == OTA_RECEIVE_ERROR) log_i("Receive Failed");
-//       else if (error == OTA_END_ERROR) log_i("End Failed");
-//     });
-
-//   ArduinoOTA.begin();
-
-//   log_d("finished initializing Arduino OTA");
-// }
 
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
@@ -170,11 +150,6 @@ void WiFiEvent(WiFiEvent_t event) {
       break;
   }
 }
-
-// void arduinoUpdater(void *pvParameters) {
-//   (void) pvParameters;
-//   // ArduinoOTA.handle();
-// }
 
 void initCamera() {
   camera_config_t config;
@@ -242,7 +217,6 @@ void initTimezone() {
 }
 
 void initMutex() {
-  // endpointMutex = xSemaphoreCreateMutex();
   feedingScheduleMutex = xSemaphoreCreateMutex();
   urlFileMutex = xSemaphoreCreateMutex();
   tzFileMutex = xSemaphoreCreateMutex();
@@ -291,6 +265,7 @@ void listDir() {
 /* TODO: Add json file to store
 *   - Weight sensor value to notify through MQTT
 *   - Handle ai server output
+*   - Use Preferences library to store simple key value data
 */
 void setup() {
 
@@ -301,6 +276,8 @@ void setup() {
 
   initServo();
   initMutex();
+
+  preferences.begin("app", false);
   
   if (!SPIFFS.begin(true)) {
     Serial.println("Error mounting spiffs");
@@ -441,6 +418,15 @@ void setup() {
     log_d("not enough space");
   }
 
+  // Init WiFi
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent(WiFiEvent);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
+    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+  }
+
   // Init server
   // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
   //   camera_fb_t* fb = esp_camera_fb_get();
@@ -461,7 +447,15 @@ void setup() {
   // });
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(SPIFFS, URL_LIST_FILE_PATH, "application/json");
+    // request->send(SPIFFS, URL_LIST_FILE_PATH, "application/json");
+    char buffer[200];
+    snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+      PREF_AI_URL_KEY, 
+      preferences.getString(PREF_AI_URL_KEY), 
+      PREF_MQTT_URL_KEY,
+      preferences.getString(PREF_MQTT_URL_KEY));
+
+    request->send(200, "application/json", buffer);
   });
 
   AsyncCallbackJsonWebHandler* urlListPostHandler = 
@@ -478,24 +472,27 @@ void setup() {
       return; 
     }
 
-    FileHandler fileHandler(SPIFFS);
+    // FileHandler fileHandler(SPIFFS);
 
-    if(!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-      xSemaphoreGive(urlFileMutex);
+    // if(!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+    //   xSemaphoreGive(urlFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
 
-    urlListDoc["aiUrl"] = json["aiUrl"].as<const char*>();
-    urlListDoc["mqttUrl"] = json["mqttUrl"].as<const char*>();
+    // urlListDoc["aiUrl"] = json["aiUrl"].as<const char*>();
+    // urlListDoc["mqttUrl"] = json["mqttUrl"].as<const char*>();
 
-    if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      xSemaphoreGive(urlFileMutex);
+    // if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+    //   xSemaphoreGive(urlFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
+
+    preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>());
+    preferences.putString(PREF_MQTT_URL_KEY, json["mqttUrl"].as<const char*>());
 
     request->send(204);
     xSemaphoreGive(urlFileMutex);
@@ -620,7 +617,14 @@ void setup() {
   });
 
   server.on("/tz", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(SPIFFS, TZ_FILE_PATH, "application/json");
+    // request->send(SPIFFS, TZ_FILE_PATH, "application/json");
+    char buffer[50];
+    snprintf(buffer, 50, "{\"%s\":\"%s\"}", 
+      PREF_TZ_KEY, 
+      preferences.getString(PREF_TZ_KEY)
+    );
+
+    request->send(200, "application/json", buffer);
   });
 
   server.on("/tz", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -635,14 +639,14 @@ void setup() {
       return;
     }
 
-    FileHandler fileHandler(SPIFFS);
+    // FileHandler fileHandler(SPIFFS);
 
-    if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)){
-      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-      xSemaphoreGive(tzFileMutex);
+    // if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)){
+    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+    //   xSemaphoreGive(tzFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
 
     AsyncWebParameter* tzParam = request->getParam("tz", true);
     if (tzParam->value() == "") {
@@ -652,14 +656,16 @@ void setup() {
       return;
     }
 
-    tzDoc["tz"] = tzParam->value();
+    // tzDoc["tz"] = tzParam->value();
 
-    if (!fileHandler.writeJson(TZ_FILE_PATH, tzDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-      xSemaphoreGive(tzFileMutex);
+    // if (!fileHandler.writeJson(TZ_FILE_PATH, tzDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+    //   xSemaphoreGive(tzFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
+
+    preferences.putString(PREF_TZ_KEY, tzParam->value());
 
     setenv("TZ", tzParam->value().c_str(), 1);
     tzset();
@@ -669,7 +675,16 @@ void setup() {
   });
 
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(SPIFFS, WIFI_CRED_FILE_PATH, "application/json");
+    // request->send(SPIFFS, WIFI_CRED_FILE_PATH, "application/json");
+    char buffer[100];
+    snprintf(buffer, 100, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+      PREF_WIFI_SSID_KEY, 
+      preferences.getString(PREF_WIFI_SSID_KEY),
+      PREF_WIFI_PASS_KEY,
+      preferences.getString(PREF_WIFI_PASS_KEY)
+    );
+
+    request->send(200, "application/json", buffer);
   });
 
   AsyncCallbackJsonWebHandler* wifiPostHandler = 
@@ -692,77 +707,82 @@ void setup() {
       return;
     }
 
-    FileHandler fileHandler(SPIFFS);
+    // FileHandler fileHandler(SPIFFS);
 
-    if(!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-      xSemaphoreGive(wifiFileMutex);
+    // if(!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+    //   xSemaphoreGive(wifiFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
 
-    wifiCredentialsDoc["ssid"] = json["ssid"];
-    if (json.containsKey("password"))
-      wifiCredentialsDoc["password"] = json["password"];
+    // wifiCredentialsDoc["ssid"] = json["ssid"];
+    // if (json.containsKey("password"))
+    //   wifiCredentialsDoc["password"] = json["password"];
     
-    if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      xSemaphoreGive(wifiFileMutex);
+    // if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
+    //   xSemaphoreGive(wifiFileMutex);
 
-      return;
-    }
+    //   return;
+    // }
 
-    request->send(201);
+    preferences.putString(PREF_WIFI_SSID_KEY, json["ssid"].as<const char*>());
+    if (json.containsKey("password"))
+      preferences.putString(PREF_WIFI_PASS_KEY, json["password"].as<const char*>());
+
+
+    request->send(204);
     WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
     xSemaphoreGive(wifiFileMutex);
   });
 
-  server.on("/notify/setting", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(SPIFFS, NOTIFY_FILE_PATH, "application/json");
-  });
+  // server.on("/notify/setting", HTTP_GET, [](AsyncWebServerRequest* request) {
+  //   request->send(SPIFFS, NOTIFY_FILE_PATH, "application/json");
+  // });
 
-  server.on("/notify/setting", HTTP_POST, [](AsyncWebServerRequest* request) {
-    if (!request->hasParam("weightToNotify", true)) {
-      request->send(400, "application/json", "{\"message\": \"missing tz field\"}");
-      return;
-    }
+  // server.on("/notify/setting", HTTP_POST, [](AsyncWebServerRequest* request) {
+  //   if (!request->hasParam("weightToNotify", true)) {
+  //     request->send(400, "application/json", "{\"message\": \"missing tz field\"}");
+  //     return;
+  //   }
 
-    if (xSemaphoreTake(notifyFileMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "internal server error");;
+  //   if (xSemaphoreTake(notifyFileMutex, portMAX_DELAY) != pdTRUE) {
+  //     request->send(500, "text/plain", "internal server error");;
 
-      return;
-    }
+  //     return;
+  //   }
 
-    FileHandler fileHandler(SPIFFS);
+  //   FileHandler fileHandler(SPIFFS);
 
-    if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)){
-      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-      xSemaphoreGive(notifyFileMutex);
+  //   if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)){
+  //     request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+  //     xSemaphoreGive(notifyFileMutex);
 
-      return;
-    }
+  //     return;
+  //   }
 
-    AsyncWebParameter* weightToNotifyParam = request->getParam("weightToNotify", true);
-    long weightToNotify = weightToNotifyParam->value().toInt();
-    if (weightToNotify < 0) {
-      request->send(400, "application/json", "{\"message\": \"value must be a positive number\"}");
-      xSemaphoreGive(notifyFileMutex);
+  //   AsyncWebParameter* weightToNotifyParam = request->getParam("weightToNotify", true);
+  //   long weightToNotify = weightToNotifyParam->value().toInt();
+  //   if (weightToNotify < 0) {
+  //     request->send(400, "application/json", "{\"message\": \"value must be a positive number\"}");
+  //     xSemaphoreGive(notifyFileMutex);
 
-      return;
-    }
+  //     return;
+  //   }
 
-    weightDoc["weightToNotify"] = weightToNotify;
+  //   weightDoc["weightToNotify"] = weightToNotify;
 
-    if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-      xSemaphoreGive(notifyFileMutex);
+  //   if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightDoc)) {
+  //     request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+  //     xSemaphoreGive(notifyFileMutex);
 
-      return;
-    }
+  //     return;
+  //   }
 
-    request->send(204);
-    xSemaphoreGive(notifyFileMutex);
-  });
+  //   request->send(204);
+  //   xSemaphoreGive(notifyFileMutex);
+  // });
 
   server.on("/servo/open", HTTP_POST, [](AsyncWebServerRequest* request) {
     if (xSemaphoreTake(servoConfigMutex, portMAX_DELAY) != pdTRUE) {
@@ -780,14 +800,23 @@ void setup() {
 
     // unsigned int delayMs = servoConfigDoc["servoOpenMs"].as<unsigned int>();
 
-    openServo(request->getParam("delay", true)->value().toInt());
+    openServo(servoConfigDoc["servoOpenMs"].as<int>());
 
     request->send(200, "application/json", "{\"message\": \"success\"}");
     xSemaphoreGive(servoConfigMutex);
   });
 
   server.on("/servo", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
+    // request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
+    char buffer[60];
+    snprintf(buffer, 60, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+      PREF_OPEN_SERVO_IF_TIMEOUT_KEY, 
+      preferences.getString(PREF_OPEN_SERVO_IF_TIMEOUT_KEY),
+      PREF_SERVO_OPEN_MS_KEY,
+      preferences.getString(PREF_SERVO_OPEN_MS_KEY)
+    );
+
+    request->send(200, "application/json", buffer);
   });
 
   server.on("/servo", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -802,14 +831,14 @@ void setup() {
       return;
     }
 
-    FileHandler fileHandler(SPIFFS);
+    // FileHandler fileHandler(SPIFFS);
 
-    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)){
-      request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-      xSemaphoreGive(servoConfigMutex);
+    // if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)){
+    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
+    //   xSemaphoreGive(servoConfigMutex);
 
-      return;
-    }
+    //   return;
+    // }
 
     AsyncWebParameter* shouldOpenIfTimeoutParam = request->getParam("shouldOpenIfTimeout", true);
     AsyncWebParameter* servoOpenMsParam = request->getParam("servoOpenMs", true);
@@ -830,15 +859,18 @@ void setup() {
       return;
     }
 
-    servoConfigDoc["shouldOpenIfTimeout"] = shouldOpenIfTimeout;
-    servoConfigDoc["servoOpenMs"] = servoOpenMs;
+    // servoConfigDoc["shouldOpenIfTimeout"] = shouldOpenIfTimeout;
+    // servoConfigDoc["servoOpenMs"] = servoOpenMs;
 
-    if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-      xSemaphoreGive(servoConfigMutex);
+    // if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+    //   request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
+    //   xSemaphoreGive(servoConfigMutex);
 
-      return;
-    }
+    //   return;
+    // }
+
+    preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout);
+    preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs);
 
     request->send(204);
     xSemaphoreGive(servoConfigMutex);
@@ -870,6 +902,11 @@ void setup() {
     }
   });
 
+  server.on("/reset", HTTP_POST, [](AsyncWebServerRequest* request) {
+    request->send(204);
+    ESP.restart();
+  });
+
   ws.onEvent(onEvent);
 
   server.addHandler(&ws);
@@ -881,25 +918,14 @@ void setup() {
 
   initTimezone();
 
-  // Init WiFi
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.onEvent(WiFiEvent);
-  WiFi.softAP(AP_SSID, AP_PASS);
-
-  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
-    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
-  }
-
-  if (WiFi.waitForConnectResult(30000) != WL_CONNECTED) {
-    log_i("Could not connect to wifi, rebooting...");
-    ESP.restart()
-
-    return;
+  while (WiFi.status() != WL_CONNECTED) {
+    log_i("Could not connect to wifi, waiting for wifi connection");
+    delay(3000);
   }
 
   digitalWrite(LED_BUILTIN, HIGH);
 
-  log_d("setup complete 11");
+  log_d("test update upload");
 }
 
 void loop() {
@@ -922,17 +948,17 @@ void loop() {
   }
 
   if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-    log_e("Failed reading feeding schedule file")
+    log_e("Failed reading feeding schedule file");
     return;
   }
 
   if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    log_e("Failed reading url file")
+    log_e("Failed reading url file");
     return;
   }
 
   if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-    log_e("Failed reading servo configuration file")
+    log_e("Failed reading servo configuration file");
     return;
   }
 
