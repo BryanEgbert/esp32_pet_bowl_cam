@@ -210,9 +210,9 @@ void initServo() {
   servo.attach(SERVO_PIN, 1000, 2000);
 }
 
-void initTimezone() {
+void initTimezone(const char* timezone) {
   configTime(0, 0, ntpServer);
-  setenv("TZ", tzDoc["tz"].as<const char*>(), 1);
+  setenv("TZ", timezone, 1);
   tzset();
 }
 
@@ -447,7 +447,6 @@ void setup() {
   // });
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
-    // request->send(SPIFFS, URL_LIST_FILE_PATH, "application/json");
     char buffer[200];
     snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_AI_URL_KEY, 
@@ -471,25 +470,6 @@ void setup() {
 
       return; 
     }
-
-    // FileHandler fileHandler(SPIFFS);
-
-    // if(!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-    //   xSemaphoreGive(urlFileMutex);
-
-    //   return;
-    // }
-
-    // urlListDoc["aiUrl"] = json["aiUrl"].as<const char*>();
-    // urlListDoc["mqttUrl"] = json["mqttUrl"].as<const char*>();
-
-    // if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListDoc)) {
-      // request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      // xSemaphoreGive(urlFileMutex);
-
-      // return;
-    // }
 
     if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0  ||
         preferences.putString(PREF_MQTT_URL_KEY, json["mqttUrl"].as<const char*>()) == 0) {
@@ -623,7 +603,6 @@ void setup() {
   });
 
   server.on("/tz", HTTP_GET, [](AsyncWebServerRequest* request) {
-    // request->send(SPIFFS, TZ_FILE_PATH, "application/json");
     char buffer[50];
     snprintf(buffer, 50, "{\"%s\":\"%s\"}", 
       PREF_TZ_KEY, 
@@ -645,15 +624,6 @@ void setup() {
       return;
     }
 
-    // FileHandler fileHandler(SPIFFS);
-
-    // if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)){
-    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-    //   xSemaphoreGive(tzFileMutex);
-
-    //   return;
-    // }
-
     AsyncWebParameter* tzParam = request->getParam("tz", true);
     if (tzParam->value() == "") {
       request->send(400, "application/json", "{\"message\": \"tz field cannot be empty\"}");
@@ -661,15 +631,6 @@ void setup() {
 
       return;
     }
-
-    // tzDoc["tz"] = tzParam->value();
-
-    // if (!fileHandler.writeJson(TZ_FILE_PATH, tzDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-    //   xSemaphoreGive(tzFileMutex);
-
-    //   return;
-    // }
 
     if (preferences.putString(PREF_TZ_KEY, tzParam->value()) == 0) {
       request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
@@ -686,7 +647,6 @@ void setup() {
   });
 
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
-    // request->send(SPIFFS, WIFI_CRED_FILE_PATH, "application/json");
     char buffer[100];
     snprintf(buffer, 100, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_WIFI_SSID_KEY, 
@@ -719,13 +679,6 @@ void setup() {
 
       return;
     }
-
-    // if (preferences.putString(PREF_WIFI_PASS_KEY, passwordParam->value()) == 0) {
-    //   request->send(500, "application/json", "{\"message\": \"failed to store password\"}\n");
-    //   xSemaphoreGive(wifiFileMutex);
-
-    //   return;
-    // }
 
     request->send(204);
     vTaskDelay(1000);
@@ -865,7 +818,6 @@ void setup() {
   });
 
   server.on("/servo", HTTP_GET, [](AsyncWebServerRequest* request) {
-    // request->send(SPIFFS, SERVO_CONFIG_FILE_PATH, "application/json");
     char buffer[60];
     snprintf(buffer, 60, "{\"%s\":%s,\"%s\":%d}", 
       PREF_OPEN_SERVO_IF_TIMEOUT_KEY, 
@@ -889,15 +841,6 @@ void setup() {
       return;
     }
 
-    // FileHandler fileHandler(SPIFFS);
-
-    // if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)){
-    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-    //   xSemaphoreGive(servoConfigMutex);
-
-    //   return;
-    // }
-
     AsyncWebParameter* shouldOpenIfTimeoutParam = request->getParam("shouldOpenIfTimeout", true);
     AsyncWebParameter* servoOpenMsParam = request->getParam("servoOpenMs", true);
 
@@ -917,17 +860,6 @@ void setup() {
       return;
     }
 
-    // servoConfigDoc["shouldOpenIfTimeout"] = shouldOpenIfTimeout;
-    // servoConfigDoc["servoOpenMs"] = servoOpenMs;
-
-    // if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-      // request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
-      // xSemaphoreGive(servoConfigMutex);
-
-      // return;
-    // }
-    // preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout);
-    // preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs);
     if (preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout) == 0 ||
         preferences.putUInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs) == 0) {
 
@@ -981,7 +913,7 @@ void setup() {
 
   server.begin();
 
-  initTimezone();
+  initTimezone(preferences.getString(PREF_TZ_KEY).c_str());
 
   while (WiFi.status() != WL_CONNECTED) {
     log_i("Could not connect to wifi, waiting for wifi connection");
@@ -998,17 +930,17 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) return;
 
-  if(!getLocalTime(&timeinfo)){
-    log_w("Failed to fetch local time");
-    return;
-  }
-
   if (xSemaphoreGetMutexHolder(feedingScheduleMutex) != nullptr || 
       xSemaphoreGetMutexHolder(urlFileMutex) != nullptr         ||
       xSemaphoreGetMutexHolder(tzFileMutex) != nullptr          || 
       xSemaphoreGetMutexHolder(wifiFileMutex) != nullptr        ||
       xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr) {
       
+    return;
+  }
+
+  if(!getLocalTime(&timeinfo)){
+    log_w("Failed to fetch local time");
     return;
   }
 
