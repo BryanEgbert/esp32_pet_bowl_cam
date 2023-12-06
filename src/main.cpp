@@ -40,7 +40,7 @@
 #define PWDN_GPIO_NUM   32
 #define RESET_GPIO_NUM  -1
 
-#define PREF_OPEN_SERVO_IF_TIMEOUT_KEY  "shouldOpenIfTimeout"
+#define PREF_OPEN_SERVO_IF_TIMEOUT_KEY  "openOnTimeout"
 #define PREF_SERVO_OPEN_MS_KEY          "servoOpenMs"
 
 #define PREF_WIFI_SSID_KEY "ssid"
@@ -451,9 +451,9 @@ void setup() {
     char buffer[200];
     snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_AI_URL_KEY, 
-      preferences.getString(PREF_AI_URL_KEY, ""), 
+      preferences.getString(PREF_AI_URL_KEY, "").c_str(), 
       PREF_MQTT_URL_KEY,
-      preferences.getString(PREF_MQTT_URL_KEY, ""));
+      preferences.getString(PREF_MQTT_URL_KEY, "").c_str());
 
     request->send(200, "application/json", buffer);
   });
@@ -627,7 +627,7 @@ void setup() {
     char buffer[50];
     snprintf(buffer, 50, "{\"%s\":\"%s\"}", 
       PREF_TZ_KEY, 
-      preferences.getString(PREF_TZ_KEY, "")
+      preferences.getString(PREF_TZ_KEY, "").c_str()
     );
 
     request->send(200, "application/json", buffer);
@@ -690,12 +690,48 @@ void setup() {
     char buffer[100];
     snprintf(buffer, 100, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_WIFI_SSID_KEY, 
-      preferences.getString(PREF_WIFI_SSID_KEY, ""),
+      preferences.getString(PREF_WIFI_SSID_KEY, "").c_str(),
       PREF_WIFI_PASS_KEY,
-      preferences.getString(PREF_WIFI_PASS_KEY, "")
+      preferences.getString(PREF_WIFI_PASS_KEY, "").c_str()
     );
 
     request->send(200, "application/json", buffer);
+  });
+
+  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("ssid", true) || !request->hasParam("password", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing required field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(wifiFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+
+      return;
+    }
+
+    AsyncWebParameter* ssidParam = request->getParam("ssid", true);
+    AsyncWebParameter* passwordParam = request->getParam("password", true);
+
+    if (preferences.putString(PREF_WIFI_SSID_KEY, ssidParam->value()) == 0 || preferences.putString(PREF_WIFI_PASS_KEY, passwordParam->value()) == 0) {
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
+      xSemaphoreGive(wifiFileMutex);
+
+      return;
+    }
+
+    // if (preferences.putString(PREF_WIFI_PASS_KEY, passwordParam->value()) == 0) {
+    //   request->send(500, "application/json", "{\"message\": \"failed to store password\"}\n");
+    //   xSemaphoreGive(wifiFileMutex);
+
+    //   return;
+    // }
+
+    request->send(204);
+    vTaskDelay(1000);
+
+    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+    xSemaphoreGive(wifiFileMutex);
   });
 
   AsyncCallbackJsonWebHandler* wifiPostHandler = 
@@ -890,7 +926,8 @@ void setup() {
 
       // return;
     // }
-
+    // preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout);
+    // preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs);
     if (preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout) == 0 ||
         preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs) == 0) {
 
@@ -940,7 +977,7 @@ void setup() {
   server.addHandler(&ws);
   server.addHandler(feedingSchedulePostHandler);
   server.addHandler(urlListPostHandler);
-  server.addHandler(wifiPostHandler);
+  // server.addHandler(wifiPostHandler);
 
   server.begin();
 
