@@ -871,7 +871,7 @@ void setup() {
       PREF_OPEN_SERVO_IF_TIMEOUT_KEY, 
       preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true) ? "true" : "false",
       PREF_SERVO_OPEN_MS_KEY,
-      preferences.getInt(PREF_SERVO_OPEN_MS_KEY, 0)
+      preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0)
     );
 
     request->send(200, "application/json", buffer);
@@ -929,7 +929,7 @@ void setup() {
     // preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout);
     // preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs);
     if (preferences.putBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, shouldOpenIfTimeout) == 0 ||
-        preferences.putInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs) == 0) {
+        preferences.putUInt(PREF_SERVO_OPEN_MS_KEY, servoOpenMs) == 0) {
 
       request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
       xSemaphoreGive(servoConfigMutex);
@@ -1012,20 +1012,20 @@ void loop() {
     return;
   }
 
-  if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-    log_e("Failed reading feeding schedule file");
-    return;
-  }
+  // if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
+  //   log_e("Failed reading feeding schedule file");
+  //   return;
+  // }
 
-  if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    log_e("Failed reading url file");
-    return;
-  }
+  // if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
+  //   log_e("Failed reading url file");
+  //   return;
+  // }
 
-  if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-    log_e("Failed reading servo configuration file");
-    return;
-  }
+  // if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
+  //   log_e("Failed reading servo configuration file");
+  //   return;
+  // }
 
   JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
   for (JsonVariant v : arrDoc) {
@@ -1044,7 +1044,7 @@ void loop() {
 
     digitalWrite(LED_BUILTIN, LOW);
 
-    String url = urlListDoc["aiUrl"].as<String>();
+    String url = preferences.getString(PREF_AI_URL_KEY, "");
     if (url == nullptr || url == "") {
       log_w("AI URL is empty");          
       return;
@@ -1119,18 +1119,18 @@ void loop() {
       if (topPrediction == "unfinished_bowl" || topPrediction == "empty_bowl") {
         digitalWrite(LED_BUILTIN, LOW);
 
-        openServo(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+        openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0));
 
         digitalWrite(LED_BUILTIN, HIGH);
       } else if (topPrediction == "floor") {
         log_d("prediction is floor, ignoring");
       }
     } else {
-      if (servoConfigDoc["shouldOpenIfTimeout"].as<bool>()) {
+      if (preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true)) {
         ws.textAll("Failed to send payload");
         
         digitalWrite(LED_BUILTIN, LOW);
-        openServo(servoConfigDoc["servoOpenMs"].as<unsigned int>());
+        openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0));
         digitalWrite(LED_BUILTIN, HIGH);
       }
     }
