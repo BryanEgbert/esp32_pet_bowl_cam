@@ -14,9 +14,7 @@
 #include <Preferences.h>
 
 #include "credentials.hpp"
-#include "freertos/FreeRTOS.h"
 #include "esp_camera.h"
-#include "esp_timer.h"
 #include "time.h"
 
 #define LED_BUILTIN     33
@@ -110,7 +108,7 @@ void printScannedWifi() {
 
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
-    client->printf("Hello client %u | There are currently %u client(s)\n", client->id(), ws.count());
+    client->printf("Hello client %u | There are currently %zu client(s)\n", client->id(), ws.count());
   } else if(type == WS_EVT_DISCONNECT){
     log_d("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
   } else if(type == WS_EVT_DATA) {
@@ -137,9 +135,6 @@ void WiFiEvent(WiFiEvent_t event) {
     case ARDUINO_EVENT_WIFI_AP_START:
       WiFi.softAPsetHostname("ESP32CAM_PetBowlCam");
       WiFi.softAPenableIpV6();
-
-      // initArduinoOTA();
-      // ArduinoOTA.setTimeout(2000);
       
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -303,109 +298,6 @@ void setup() {
     return;
   }
 
-  if (!SPIFFS.exists(URL_LIST_FILE_PATH)) {
-    if (!fileHandler.createFile(URL_LIST_FILE_PATH)) {
-      log_e("Failed to create file content");
-      return;
-    }
-
-    JsonObject urlListObj = urlListDoc.to<JsonObject>();
-    urlListObj["aiUrl"] = "";
-    urlListObj["mqttUrl"] = "";
-
-    if (!fileHandler.writeJson(URL_LIST_FILE_PATH, urlListObj)) {
-      log_e("Failed to write to file");
-      return;
-    }
-  }
-
-  if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-    log_e("Failed to read url file");
-    return;
-  }
-
-  if (!SPIFFS.exists(TZ_FILE_PATH)) {
-    if (!fileHandler.createFile(TZ_FILE_PATH)) {
-      log_e("Failed to create file content");
-      return;
-    }
-
-    JsonObject tzObj = tzDoc.to<JsonObject>();
-    tzObj["tz"] = "UTC0";
-
-    if (!fileHandler.writeJson(TZ_FILE_PATH, tzObj)) {
-      log_e("Failed to write to file");
-      return;
-    }
-  }
-
-  if (!fileHandler.readJson(TZ_FILE_PATH, tzDoc)) {
-    log_e("Failed to read url file");
-    return;
-  }
-
-  if (!SPIFFS.exists(WIFI_CRED_FILE_PATH)) {
-    if (!fileHandler.createFile(WIFI_CRED_FILE_PATH)) {
-      log_e("Failed to create file content");
-      return;
-    }
-
-    JsonObject wifiObj = wifiCredentialsDoc.to<JsonObject>();
-    wifiObj["ssid"] = "";
-    wifiObj["password"] = "";
-
-    if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiObj)) {
-      log_e("Failed to write to file");
-      return;
-    }
-  }
-
-  if (!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-    log_e("Failed to read url file");
-    return;
-  }
-
-  if (!SPIFFS.exists(NOTIFY_FILE_PATH)) {
-    if (!fileHandler.createFile(NOTIFY_FILE_PATH)) {
-      log_e("Failed to create file content");
-      return;
-    }
-
-    JsonObject weightObj = weightDoc.to<JsonObject>();
-    weightObj["weightToNotify"] = 0;
-
-    if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightObj)) {
-      log_e("Failed to write to file");
-      return;
-    }
-  }
-
-  if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)) {
-    log_e("Failed to read url file");
-    return;
-  }
-
-  if (!SPIFFS.exists(SERVO_CONFIG_FILE_PATH)) {
-    if (!fileHandler.createFile(SERVO_CONFIG_FILE_PATH)) {
-      log_e("Failed to create file content");
-      return;
-    }
-
-    JsonObject servoConfigObj = servoConfigDoc.to<JsonObject>();
-    servoConfigDoc["servoOpenMs"] = 0;
-    servoConfigDoc["shouldOpenIfTimeout"] = true;
-
-    if (!fileHandler.writeJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-      log_e("Failed to write to file");
-      return;
-    }
-  }
-
-  if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-    log_e("Failed to read url file");
-    return;
-  }
-
   listDir();
   psramInit();
 
@@ -428,21 +320,22 @@ void setup() {
   }
 
   // Init server
+
   // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
   //   camera_fb_t* fb = esp_camera_fb_get();
-
+  //
   //   if (!fb) {
   //     request->send(500, "text/plain", "failed to capture photo\n");
   //     return;
   //   }
-
+  //
   //   // request->send(200, "text/jpeg", );
   //   AsyncWebServerResponse *response = request->beginResponse_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
   //   // response->addHeader("Content-Encoding", "gzip");
   //   response->addHeader("Content-Disposition", "inline");
   //   response->addHeader("Access-Control-Allow-Origin", "*");
   //   esp_camera_fb_return(fb);
-
+  //
   //   request->send(response);
   // });
 
@@ -757,40 +650,40 @@ void setup() {
   //     request->send(400, "application/json", "{\"message\": \"missing tz field\"}");
   //     return;
   //   }
-
+  //
   //   if (xSemaphoreTake(notifyFileMutex, portMAX_DELAY) != pdTRUE) {
   //     request->send(500, "text/plain", "internal server error");;
-
+  //
   //     return;
   //   }
-
+  //
   //   FileHandler fileHandler(SPIFFS);
-
+  //
   //   if (!fileHandler.readJson(NOTIFY_FILE_PATH, weightDoc)){
   //     request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
   //     xSemaphoreGive(notifyFileMutex);
-
+  //
   //     return;
   //   }
-
+  //
   //   AsyncWebParameter* weightToNotifyParam = request->getParam("weightToNotify", true);
   //   long weightToNotify = weightToNotifyParam->value().toInt();
   //   if (weightToNotify < 0) {
   //     request->send(400, "application/json", "{\"message\": \"value must be a positive number\"}");
   //     xSemaphoreGive(notifyFileMutex);
-
+  //
   //     return;
   //   }
-
+  //
   //   weightDoc["weightToNotify"] = weightToNotify;
-
+  //
   //   if (!fileHandler.writeJson(NOTIFY_FILE_PATH, weightDoc)) {
   //     request->send(500, "application/json", "{\"message\": \"failed writing to a file\"}");
   //     xSemaphoreGive(notifyFileMutex);
-
+  //
   //     return;
   //   }
-
+  //
   //   request->send(204);
   //   xSemaphoreGive(notifyFileMutex);
   // });
@@ -881,7 +774,7 @@ void setup() {
     request->send(response);
 
   }, [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
-    log_d("Handling file upload, filename = %s | index = %d | len = %d | final = %d", filename, index, len, final);
+    log_d("Handling file upload, filename = %s | index = %d | len = %d | final = %d", filename.c_str(), index, len, final);
     if(len){
       if (Update.write(data, len) != len) {
         return request->send(400, "text/plain", "Failed to write chunked data to free space");
@@ -890,7 +783,7 @@ void setup() {
         
     if (final) {
       if (!Update.end(true)) {
-        log_d("/update: %s", String(Update.getError()));
+        log_d("/update: %s", String(Update.getError()).c_str());
       }
 
       log_i("Update successfully completed. Please reboot your device");
@@ -913,7 +806,7 @@ void setup() {
 
   server.begin();
 
-  initTimezone(preferences.getString(PREF_TZ_KEY).c_str());
+  initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
 
   while (WiFi.status() != WL_CONNECTED) {
     log_i("Could not connect to wifi, waiting for wifi connection");
@@ -944,21 +837,6 @@ void loop() {
     return;
   }
 
-  // if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
-  //   log_e("Failed reading feeding schedule file");
-  //   return;
-  // }
-
-  // if (!fileHandler.readJson(URL_LIST_FILE_PATH, urlListDoc)) {
-  //   log_e("Failed reading url file");
-  //   return;
-  // }
-
-  // if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-  //   log_e("Failed reading servo configuration file");
-  //   return;
-  // }
-
   JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
   for (JsonVariant v : arrDoc) {
     if (v["hour"].as<int>() != timeinfo.tm_hour   || 
@@ -978,7 +856,7 @@ void loop() {
 
     String url = preferences.getString(PREF_AI_URL_KEY, "");
     if (url == nullptr || url == "") {
-      log_w("AI URL is empty");          
+      log_w("AI URL is empty");        
       return;
     }
 
