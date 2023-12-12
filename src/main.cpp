@@ -12,8 +12,12 @@
 #include <ESP32Servo.h>
 #include <Update.h>
 #include <Preferences.h>
+#include <MQTT.h>
 
+#include "MQTTClient.h"
+#include "WiFiClient.h"
 #include "credentials.hpp"
+#include "esp32-hal-log.h"
 #include "esp_camera.h"
 #include "time.h"
 
@@ -45,14 +49,19 @@
 #define PREF_WIFI_PASS_KEY "password"
 
 #define PREF_AI_URL_KEY   "aiUrl"
-#define PREF_MQTT_URL_KEY "mqttUrl"
+
+#define PREF_MQTT_HOST_KEY "mqttHost"
+#define PREF_MQTT_PORT_KEY "mqttPort"
+#define PREF_MQTT_USERNAME "mqttUsername"
+#define PREF_MQTT_PASSWORD "mqttPassword"
 
 #define PREF_TZ_KEY "tz"
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 SemaphoreHandle_t feedingScheduleMutex, 
-                  urlFileMutex, 
+                  urlFileMutex,
+                  mqttFileMutex, 
                   tzFileMutex,
                   wifiFileMutex,
                   notifyFileMutex,
@@ -81,6 +90,8 @@ const char* SERVO_CONFIG_FILE_PATH = "/servo_config.json";
 unsigned long currentMillis = 0;
 
 Preferences preferences;
+WiFiClient wifiClient;
+MQTTClient mqttClient;
 
 void openServo(int delayMs) {
   log_d("Opening servo");
@@ -105,6 +116,16 @@ void printScannedWifi() {
     Serial.printf(" | (%4d) | [%2d]\n", WiFi.RSSI(i), WiFi.channel(i));
   }
 }
+
+void messageReceived(String &topic, String &payload) {
+  log_d("incoming: %s - %s", topic.c_str(), payload.c_str());
+
+  // Note: Do not use the client in the callback to publish, subscribe or
+  // unsubscribe as it may cause deadlocks when other things arrive while
+  // sending and receiving acknowledgments. Instead, change a global variable,
+  // or push to a queue and handle it in the loop after calling `client.loop()`.
+}
+
 
 void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
@@ -140,7 +161,10 @@ void WiFiEvent(WiFiEvent_t event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       WiFi.enableIpV6();
 
-      break;
+    // case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+    //   delay(1000);
+
+    //   break;
     default:
       break;
   }
@@ -201,6 +225,7 @@ void initServo() {
 	ESP32PWM::allocateTimer(1);
 	ESP32PWM::allocateTimer(2);
 	ESP32PWM::allocateTimer(3);
+
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 1000, 2000);
 }
@@ -218,6 +243,7 @@ void initMutex() {
   wifiFileMutex = xSemaphoreCreateMutex();
   notifyFileMutex = xSemaphoreCreateMutex();
   servoConfigMutex = xSemaphoreCreateMutex();
+  mqttFileMutex = xSemaphoreCreateMutex();
 
 
   if (feedingScheduleMutex == nullptr || 
@@ -225,7 +251,8 @@ void initMutex() {
       tzFileMutex == nullptr          ||
       wifiFileMutex == nullptr        ||
       notifyFileMutex == nullptr      ||
-      servoConfigMutex == nullptr) {
+      servoConfigMutex == nullptr     ||
+      mqttFileMutex == nullptr) {
     log_e("Error initializing mutex, restarting...");
     ESP.restart();
   }
@@ -315,8 +342,10 @@ void setup() {
   WiFi.onEvent(WiFiEvent);
   WiFi.softAP(AP_SSID, AP_PASS);
 
-  if (wifiCredentialsDoc["ssid"].as<String>() != "" && wifiCredentialsDoc.containsKey("password")) {
-    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+  printScannedWifi();
+
+  if (preferences.getString(PREF_WIFI_SSID_KEY, "") != "") {
+    WiFi.begin(preferences.getString(PREF_WIFI_SSID_KEY, "").c_str(), preferences.getString(PREF_WIFI_PASS_KEY, "").c_str());
   }
 
   // Init server
@@ -340,20 +369,93 @@ void setup() {
   // });
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
-    char buffer[200];
-    snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+    char buffer[100];
+    snprintf(buffer, 100, "{\"%s\":\"%s\"}", 
       PREF_AI_URL_KEY, 
-      preferences.getString(PREF_AI_URL_KEY, "").c_str(), 
-      PREF_MQTT_URL_KEY,
-      preferences.getString(PREF_MQTT_URL_KEY, "").c_str());
+      preferences.getString(PREF_AI_URL_KEY, "").c_str());
 
     request->send(200, "application/json", buffer);
+  });
+
+  server.on("/mqtt", HTTP_GET, [](AsyncWebServerRequest* request)  {
+    char buffer[250];
+    snprintf(buffer, 250, "{\"%s\":\"%s\",\"%s\":\"%d\",\"%s\":\"%s\",\"%s\":\"%s\"}", 
+      PREF_MQTT_HOST_KEY,
+      preferences.getString(PREF_MQTT_HOST_KEY, "").c_str(),
+      PREF_MQTT_PORT_KEY,
+      preferences.getUInt(PREF_MQTT_PORT_KEY, 1883),
+      PREF_MQTT_USERNAME,
+      preferences.getString(PREF_MQTT_USERNAME, "").c_str(),
+      PREF_MQTT_PASSWORD,
+      preferences.getString(PREF_MQTT_PASSWORD, "").c_str()
+    );
+
+    request->send(200, "application/json", buffer);
+  });
+  
+  server.on("/mqtt", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("host", true) || !request->hasParam("port", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing required field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(mqttFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+
+      return;
+    }
+
+    AsyncWebParameter* hostParam = request->getParam("host", true);
+    if (hostParam->value() == "") {
+      request->send(400, "application/json", "{\"message\": \"host field cannot be empty\"}");
+      xSemaphoreGive(mqttFileMutex);
+
+      return;
+    }
+
+    AsyncWebParameter* portParam = request->getParam("port", true);
+    if (portParam->value() == "") {
+      request->send(400, "application/json", "{\"message\": \"port field cannot be empty\"}");
+      xSemaphoreGive(mqttFileMutex);
+
+      return;
+    }
+
+    int port = portParam->value().toInt();
+    if (port < 0) {
+      request->send(400, "application/json", "{\"message\": \"port field must be a valid positive number\"}");
+      xSemaphoreGive(mqttFileMutex);
+
+      return;
+    }
+
+    if (preferences.putString(PREF_MQTT_HOST_KEY, hostParam->value()) == 0 ||
+        preferences.putUInt(PREF_MQTT_PORT_KEY, port) == 0) {
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+      xSemaphoreGive(mqttFileMutex);
+
+      return;
+    };
+
+    if (request->hasParam("username", true) && request->hasParam("password", true)) {
+      if (preferences.putString(PREF_MQTT_USERNAME, request->getParam("username", true)->value()) == 0 ||
+          preferences.putString(PREF_MQTT_PASSWORD, request->getParam("password", true)->value()) == 0) {
+        
+        request->send(500, "application/json", "{\"message\": \"failed to username and password data\"}");
+        xSemaphoreGive(mqttFileMutex);
+
+        return;
+      }
+    }
+
+    request->send(201);
+    xSemaphoreGive(mqttFileMutex);
   });
 
   AsyncCallbackJsonWebHandler* urlListPostHandler = 
     new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
   
-    if (!json.containsKey("aiUrl") || !json.containsKey("mqttUrl")) {
+    if (!json.containsKey("aiUrl")) {
       request->send(400, "application/json", "{\"message\": \"missing url field\"}");
       return;
     }
@@ -364,8 +466,7 @@ void setup() {
       return; 
     }
 
-    if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0  ||
-        preferences.putString(PREF_MQTT_URL_KEY, json["mqttUrl"].as<const char*>()) == 0) {
+    if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0) {
 
       request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
       xSemaphoreGive(urlFileMutex);
@@ -576,7 +677,7 @@ void setup() {
     request->send(204);
     vTaskDelay(1000);
 
-    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
+    WiFi.begin(preferences.getString(PREF_WIFI_SSID_KEY, "").c_str(), preferences.getString(PREF_WIFI_PASS_KEY, "").c_str());
     xSemaphoreGive(wifiFileMutex);
   });
 
@@ -794,6 +895,8 @@ void setup() {
 
   server.on("/reset", HTTP_POST, [](AsyncWebServerRequest* request) {
     request->send(204);
+
+    vTaskDelay(1000);
     ESP.restart();
   });
 
@@ -810,12 +913,53 @@ void setup() {
 
   while (WiFi.status() != WL_CONNECTED) {
     log_i("Could not connect to wifi, waiting for wifi connection");
+
     delay(3000);
   }
 
+  if (preferences.getString(PREF_MQTT_HOST_KEY, "") != "") {
+    mqttClient.begin(
+      preferences.getString(PREF_MQTT_HOST_KEY, "").c_str(), 
+      preferences.getUInt(PREF_MQTT_PORT_KEY, 1883), 
+      wifiClient);
+
+    mqttClient.setTimeout(10000);
+    mqttClient.onMessage(messageReceived);
+
+
+    if (preferences.getString(PREF_MQTT_USERNAME, "") == "") {
+      if (!mqttClient.connect("petBowlCam")) {
+        log_w("Error connecting to MQTT client");
+      } else {
+        if (!mqttClient.subscribe("petBowlCam/test")) {
+          log_e("Error subscribing to queue");
+        }
+        if (!mqttClient.publish("petBowlCam/test", "testing", true, 1)) {
+          log_e("Error publishing to queue");
+        }
+      }
+    } else {
+      if (!mqttClient.connect(
+        "petBowlCam", 
+        preferences.getString(PREF_MQTT_USERNAME, "").c_str(),
+        preferences.getString(PREF_MQTT_PASSWORD, "").c_str())
+      ) {
+        log_w("Error connecting to MQTT client");
+      } else {
+        if (!mqttClient.subscribe("petBowlCam/test")) {
+          log_e("Error subscribing to queue");
+        }
+        if (!mqttClient.publish("petBowlCam/test", "testing", true, 1)) {
+          log_e("Error publishing to queue");
+        }
+      }
+    }
+  }
+
+
   digitalWrite(LED_BUILTIN, HIGH);
 
-  log_d("test update upload");
+  log_d("test update upload from web 2");
 }
 
 void loop() {
@@ -823,11 +967,14 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) return;
 
+  mqttClient.loop();
+
   if (xSemaphoreGetMutexHolder(feedingScheduleMutex) != nullptr || 
       xSemaphoreGetMutexHolder(urlFileMutex) != nullptr         ||
       xSemaphoreGetMutexHolder(tzFileMutex) != nullptr          || 
       xSemaphoreGetMutexHolder(wifiFileMutex) != nullptr        ||
-      xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr) {
+      xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr     ||
+      xSemaphoreGetMutexHolder(mqttFileMutex) != nullptr) {
       
     return;
   }
@@ -845,7 +992,7 @@ void loop() {
           continue;
     }
 
-    log_i("Time matched: %d:%d| %d:%d", 
+    log_i("Time matched: %d:%d | %d:%d", 
       v["hour"].as<int>(), 
       v["minutes"].as<int>(), 
       timeinfo.tm_hour, 
@@ -936,9 +1083,10 @@ void loop() {
         log_d("prediction is floor, ignoring");
       }
     } else {
-      if (preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true)) {
-        ws.textAll("Failed to send payload");
-        
+      ws.textAll("Failed to send payload");
+      log_w("Failed to send payload");
+
+      if (preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true)) {  
         digitalWrite(LED_BUILTIN, LOW);
         openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0));
         digitalWrite(LED_BUILTIN, HIGH);
