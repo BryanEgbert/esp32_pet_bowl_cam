@@ -13,12 +13,19 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <MQTT.h>
+#include <cstring>
+#include <stdio.h>
+#include <sys/_stdint.h>
 
-#include "MQTTClient.h"
-#include "WiFiClient.h"
+#include "Esp.h"
+#include "WiFiType.h"
 #include "credentials.hpp"
+#include "esp32-hal-adc.h"
 #include "esp32-hal-log.h"
+#include "esp32-hal.h"
 #include "esp_camera.h"
+#include "freertos/portmacro.h"
+#include "freertos/projdefs.h"
 #include "time.h"
 
 #define LED_BUILTIN     33
@@ -47,6 +54,10 @@
 
 #define PREF_WIFI_SSID_KEY "ssid"
 #define PREF_WIFI_PASS_KEY "password"
+#define PREF_WIFI_IP "wifiIp"
+#define PREF_WIFI_GATEWAY "wifiGateway"
+#define PREF_WIFI_SUBMASK "wifiSubmask"
+#define PREF_DNS "dns"
 
 #define PREF_AI_URL_KEY   "aiUrl"
 
@@ -57,56 +68,71 @@
 
 #define PREF_TZ_KEY "tz"
 
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
-SemaphoreHandle_t feedingScheduleMutex, 
+#define PREF_TIME_SERVER_URL_KEY1 "timeServerUrl1"
+#define PREF_TIME_SERVER_URL_KEY2 "timeServerUrl2"
+#define PREF_TIME_SERVER_URL_KEY3 "timeServerUrl3"
+
+#define MQTT_TOPIC "petBowlCam/test"
+
+static AsyncWebServer server(80);
+// AsyncWebSocket ws("/ws");
+static SemaphoreHandle_t feedingScheduleMutex, 
                   urlFileMutex,
                   mqttFileMutex, 
                   tzFileMutex,
                   wifiFileMutex,
                   notifyFileMutex,
-                  servoConfigMutex;
+                  servoConfigMutex,
+                  timeServerConfigMutex;
 
-Servo servo;
-FileHandler fileHandler(SPIFFS);
+static Servo servo;
+static String timeErrorId = "";
 
-const char* ntpServer = "pool.ntp.org";
+static FileHandler fileHandler(SPIFFS);
 
-DynamicJsonDocument feedingScheduleDoc(384);
-DynamicJsonDocument urlListDoc(192);
-DynamicJsonDocument httpPredictionResponseDoc(192);
-DynamicJsonDocument servoConfigDoc(96);
-DynamicJsonDocument tzDoc(64);
-DynamicJsonDocument wifiCredentialsDoc(128);
-DynamicJsonDocument weightDoc(48);
+static DynamicJsonDocument feedingScheduleDoc(384);
+static DynamicJsonDocument httpPredictionResponseDoc(192);
+static DynamicJsonDocument hardwareInfoDoc(500);
 
-const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
-const char* URL_LIST_FILE_PATH = "/url_list.json";
-const char* TZ_FILE_PATH = "/timezone.json";
-const char* WIFI_CRED_FILE_PATH = "/wifi_cred.json";
-const char* NOTIFY_FILE_PATH = "/notify_config.json";
-const char* SERVO_CONFIG_FILE_PATH = "/servo_config.json";
+static const char* FEEDING_SCHEDULE_FILE_PATH = "/feeding_schedule.json";
+static const char* HARDWARE_INFO_FILE_PATH = "/hardware_info.json";
 
-unsigned long currentMillis = 0;
+static uint16_t currentMillis = 0;
+static const char charArr[] PROGMEM = "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM"; 
 
-Preferences preferences;
-WiFiClient wifiClient;
-MQTTClient mqttClient;
+static Preferences preferences;
+static WiFiClient wifiClient;
+static MQTTClient mqttClient(255);
 
-void openServo(int delayMs) {
-  log_d("Opening servo");
-  for (int pos = 0; pos <= 180; pos++) {
-    servo.write(pos);
+static QueueHandle_t servoQueue;
+bool shouldOpenServo = false;
+
+
+void openServo(uint32_t delayMs) {
+  uint32_t currMillis = millis();
+
+  log_v("Opening servo");
+  while(true) {
+    for (int pos = 0; pos <= 180; pos++) {
+      servo.write(pos);
+      delay(15);
+    }
+    log_v("Done opening servo");
+  
+    while (millis() - currMillis < delayMs) {}
+
+    log_v("Closing servo");
+    if (millis() - currMillis >= delayMs) {
+      for (int pos = 180; pos >= 0; pos--) {
+        servo.write(pos);
+        delay(15);
+      }
+    }
+
+    break;
   }
 
-  log_d("Done opening servo");
-  delay(delayMs);
-
-  log_d("Closing servo");
-  for (int pos = 180; pos >= 0; pos--) {
-    servo.write(pos);
-  }
-  log_d("Done closing servo");
+  log_v("Done closing servo");
 }
 
 void printScannedWifi() {
@@ -115,6 +141,15 @@ void printScannedWifi() {
     Serial.print(WiFi.SSID(i));
     Serial.printf(" | (%4d) | [%2d]\n", WiFi.RSSI(i), WiFi.channel(i));
   }
+}
+
+String generateRandomString(unsigned int len) {
+  String output = "";
+  for (int i = 0; i < len; ++i) {
+    output += charArr[random(strlen(charArr))];
+  }
+
+  return output;
 }
 
 void messageReceived(String &topic, String &payload) {
@@ -126,30 +161,43 @@ void messageReceived(String &topic, String &payload) {
   // or push to a queue and handle it in the loop after calling `client.loop()`.
 }
 
-
-void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
-  if (type == WS_EVT_CONNECT) {
-    client->printf("Hello client %u | There are currently %zu client(s)\n", client->id(), ws.count());
-  } else if(type == WS_EVT_DISCONNECT){
-    log_d("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
-  } else if(type == WS_EVT_DATA) {
-    AwsFrameInfo * info = (AwsFrameInfo*)arg;
-
-    if(info->final && info->index == 0 && info->len == len) {
-      log_d("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text":"binary", info->len);
-
-      if (info->opcode == WS_TEXT) {
-        data[len] = 0;
-        if (String((char*)data) == String("request_image")) {
-          camera_fb_t* fb = esp_camera_fb_get();
-    
-          client->binary(fb->buf, fb->len);
-          esp_camera_fb_return(fb);
-        }
-      }
-    }
+boolean mqttConnect() {
+  boolean output;
+  if (preferences.getString(PREF_MQTT_USERNAME, "") == "") {
+    output = mqttClient.connect("petBowlCam");
+  } else {
+    output = mqttClient.connect(
+      "petBowlCam", 
+      preferences.getString(PREF_MQTT_USERNAME, "").c_str(),
+      preferences.getString(PREF_MQTT_PASSWORD, "").c_str());
   }
+
+  return output;
 }
+
+// void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
+//   if (type == WS_EVT_CONNECT) {
+//     client->printf("Hello client %u | There are currently %zu client(s)\n", client->id(), ws.count());
+//   } else if(type == WS_EVT_DISCONNECT){
+//     log_d("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
+//   } else if(type == WS_EVT_DATA) {
+//     AwsFrameInfo * info = (AwsFrameInfo*)arg;
+
+//     if(info->final && info->index == 0 && info->len == len) {
+//       log_d("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text":"binary", info->len);
+
+//       if (info->opcode == WS_TEXT) {
+//         data[len] = 0;
+//         if (String((char*)data) == String("request_image")) {
+//           camera_fb_t* fb = esp_camera_fb_get();
+    
+//           client->binary(fb->buf, fb->len);
+//           esp_camera_fb_return(fb);
+//         }
+//       }
+//     }
+//   }
+// }
 
 void WiFiEvent(WiFiEvent_t event) {
   switch(event) {
@@ -160,6 +208,8 @@ void WiFiEvent(WiFiEvent_t event) {
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       WiFi.enableIpV6();
+
+      break;
 
     // case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
     //   delay(1000);
@@ -192,13 +242,13 @@ void initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 2000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
 
   if (psramFound()) {
     config.frame_size = FRAMESIZE_UXGA;
     config.jpeg_quality = 10;
-    config.fb_count = 2;
+    config.fb_count = 1;
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
@@ -207,7 +257,7 @@ void initCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    log_e("Camera init failed with error 0x%x", err);
     ESP.restart();
   }
 
@@ -231,7 +281,16 @@ void initServo() {
 }
 
 void initTimezone(const char* timezone) {
-  configTime(0, 0, ntpServer);
+  String server2 = preferences.getString(PREF_TIME_SERVER_URL_KEY2, "");
+  String server3 = preferences.getString(PREF_TIME_SERVER_URL_KEY3, "");
+
+  configTime(
+    0, 
+    0, 
+    preferences.getString(PREF_TIME_SERVER_URL_KEY1, "pool.ntp.org").c_str(),
+    server2 == "" ? nullptr : server2.c_str(),
+    server3 == "" ? nullptr : server3.c_str());
+
   setenv("TZ", timezone, 1);
   tzset();
 }
@@ -244,14 +303,16 @@ void initMutex() {
   notifyFileMutex = xSemaphoreCreateMutex();
   servoConfigMutex = xSemaphoreCreateMutex();
   mqttFileMutex = xSemaphoreCreateMutex();
+  timeServerConfigMutex = xSemaphoreCreateMutex();
 
 
-  if (feedingScheduleMutex == nullptr || 
-      urlFileMutex == nullptr         || 
-      tzFileMutex == nullptr          ||
-      wifiFileMutex == nullptr        ||
-      notifyFileMutex == nullptr      ||
-      servoConfigMutex == nullptr     ||
+  if (feedingScheduleMutex == nullptr   || 
+      urlFileMutex == nullptr           || 
+      tzFileMutex == nullptr            ||
+      wifiFileMutex == nullptr          ||
+      notifyFileMutex == nullptr        ||
+      servoConfigMutex == nullptr       ||
+      timeServerConfigMutex == nullptr  ||
       mqttFileMutex == nullptr) {
     log_e("Error initializing mutex, restarting...");
     ESP.restart();
@@ -284,13 +345,10 @@ void listDir() {
   }
 }
 
-/* TODO: Add json file to store
+/* TODO:
 *   - Weight sensor value to notify through MQTT
-*   - Handle ai server output
-*   - Use Preferences library to store simple key value data
 */
 void setup() {
-
   Serial.begin(115200);
 
   pinMode(LED_BUILTIN, OUTPUT);
@@ -299,10 +357,18 @@ void setup() {
   initServo();
   initMutex();
 
+  servoQueue = xQueueCreate(10, sizeof(shouldOpenServo));
+  if (servoQueue == nullptr) {
+    log_e("Failed to initialize queue");
+    delay(10);
+
+    ESP.restart();
+  }
+
   preferences.begin("app", false);
   
   if (!SPIFFS.begin(true)) {
-    Serial.println("Error mounting spiffs");
+    log_e("Error mounting spiffs");
     return;
   }
 
@@ -318,20 +384,68 @@ void setup() {
       log_e("Failed to write to file");
       return;
     }
-  }
+  } 
 
   if (!fileHandler.readJson(FEEDING_SCHEDULE_FILE_PATH, feedingScheduleDoc)) {
     log_e("Failed to read file content");
     return;
   }
 
+  if (!SPIFFS.exists(HARDWARE_INFO_FILE_PATH)) {
+    if (!fileHandler.createFile(HARDWARE_INFO_FILE_PATH)) {
+      log_e("Failed to create file content");
+      return;
+    }
+  }
+
+  JsonObject hardwareInfoObj = hardwareInfoDoc.to<JsonObject>();
+
+  String flashChipMode = "unknown";
+  switch (ESP.getFlashChipMode()) {
+    case FM_QIO:
+      flashChipMode = "Quad I/O";
+      break;
+    case FM_QOUT:
+      flashChipMode = "Quad Output";
+      break;
+    case FM_DIO:
+      flashChipMode = "Dual I/O";
+      break;
+    case FM_DOUT:
+      flashChipMode = "Dual Output";
+      break;
+    case FM_FAST_READ:
+      flashChipMode = "Fast Read";
+      break;
+    case FM_SLOW_READ:
+      flashChipMode = "Slow Read";
+      break;
+    default:
+      break;
+  };
+
+  hardwareInfoObj["chipModel"] = ESP.getChipModel();
+  hardwareInfoObj["chipCores"] = ESP.getChipCores();
+  hardwareInfoObj["chipRevision"] = ESP.getChipRevision();
+  hardwareInfoObj["flashChipMode"] = flashChipMode.c_str();
+  hardwareInfoObj["flashChipSize"] = ESP.getFlashChipSize();
+  hardwareInfoObj["flashChipSpeed"] = ESP.getFlashChipSpeed();
+  hardwareInfoObj["macAddress"] = ESP.getEfuseMac();
+  hardwareInfoObj["heapSize"] = ESP.getHeapSize();
+  hardwareInfoObj["freeHeapSize"] = ESP.getFreeHeap();
+  hardwareInfoObj["psramSize"] = ESP.getPsramSize();
+  hardwareInfoObj["freePsramSize"] = ESP.getFreePsram();
+  hardwareInfoObj["sdkVersion"] = ESP.getSdkVersion();
+
+  if (!fileHandler.writeJson(HARDWARE_INFO_FILE_PATH, hardwareInfoObj)) {
+    log_e("Failed to write to file");
+    return;
+  }
+
   listDir();
   psramInit();
 
-  byte* psdRamBuffer = (byte*)ps_malloc(1024 * 1024 * 4);
-
-  // Init Camera
-  initCamera();
+  byte* psdRamBuffer = (byte*)ps_malloc(1024 * 1024 * 2);
 
   if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
     log_d("not enough space");
@@ -350,23 +464,23 @@ void setup() {
 
   // Init server
 
-  // server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
-  //   camera_fb_t* fb = esp_camera_fb_get();
-  //
-  //   if (!fb) {
-  //     request->send(500, "text/plain", "failed to capture photo\n");
-  //     return;
-  //   }
-  //
-  //   // request->send(200, "text/jpeg", );
-  //   AsyncWebServerResponse *response = request->beginResponse_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
-  //   // response->addHeader("Content-Encoding", "gzip");
-  //   response->addHeader("Content-Disposition", "inline");
-  //   response->addHeader("Access-Control-Allow-Origin", "*");
-  //   esp_camera_fb_return(fb);
-  //
-  //   request->send(response);
-  // });
+  server.on("/photo", HTTP_GET, [](AsyncWebServerRequest *request) {
+    camera_fb_t* fb = esp_camera_fb_get();
+  
+    if (!fb) {
+      request->send(500, "text/plain", "failed to capture photo\n");
+      return;
+    }
+  
+    // request->send(200, "text/jpeg", );
+    AsyncWebServerResponse *response = request->beginResponse_P(200, "image/jpeg", (const uint8_t*)fb->buf, fb->len);
+    // response->addHeader("Content-Encoding", "gzip");
+    response->addHeader("Content-Disposition", "inline");
+    response->addHeader("Access-Control-Allow-Origin", "*");
+    esp_camera_fb_return(fb);
+  
+    request->send(response);
+  });
 
   server.on("/url", HTTP_GET, [](AsyncWebServerRequest* request) {
     char buffer[100];
@@ -377,9 +491,35 @@ void setup() {
     request->send(200, "application/json", buffer);
   });
 
+  AsyncCallbackJsonWebHandler* urlListPostHandler = 
+    new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
+  
+    if (!json.containsKey("aiUrl")) {
+      request->send(400, "application/json", "{\"message\": \"missing url field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(urlFileMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "max client allowed");
+
+      return; 
+    }
+
+    if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0) {
+
+      request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
+      xSemaphoreGive(urlFileMutex);
+
+      return;
+    }
+
+    request->send(204);
+    xSemaphoreGive(urlFileMutex);
+  });
+
   server.on("/mqtt", HTTP_GET, [](AsyncWebServerRequest* request)  {
     char buffer[250];
-    snprintf(buffer, 250, "{\"%s\":\"%s\",\"%s\":\"%d\",\"%s\":\"%s\",\"%s\":\"%s\"}", 
+    snprintf(buffer, 250, "{\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\",\"%s\":\"%s\"}", 
       PREF_MQTT_HOST_KEY,
       preferences.getString(PREF_MQTT_HOST_KEY, "").c_str(),
       PREF_MQTT_PORT_KEY,
@@ -452,32 +592,6 @@ void setup() {
     xSemaphoreGive(mqttFileMutex);
   });
 
-  AsyncCallbackJsonWebHandler* urlListPostHandler = 
-    new AsyncCallbackJsonWebHandler("/url", [](AsyncWebServerRequest* request, JsonVariant &json) {
-  
-    if (!json.containsKey("aiUrl")) {
-      request->send(400, "application/json", "{\"message\": \"missing url field\"}");
-      return;
-    }
-
-    if (xSemaphoreTake(urlFileMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "max client allowed");
-
-      return; 
-    }
-
-    if (preferences.putString(PREF_AI_URL_KEY, json["aiUrl"].as<const char*>()) == 0) {
-
-      request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
-      xSemaphoreGive(urlFileMutex);
-
-      return;
-    }
-
-    request->send(204);
-    xSemaphoreGive(urlFileMutex);
-  });
-
   server.on("/feeding_schedule", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(SPIFFS, FEEDING_SCHEDULE_FILE_PATH, "application/json");
   });
@@ -486,6 +600,11 @@ void setup() {
     new AsyncCallbackJsonWebHandler("/feeding_schedule", [](AsyncWebServerRequest* request, JsonVariant &json) {
     if (json.is<JsonArray>()) {
       request->send(400, "application/json", "{\"message\": \"invalid request\"}\n");
+      return;
+    }
+
+    if (feedingScheduleDoc.size() >= 5) {
+      request->send(403, "application/json", "{\"message\": \"you have reached the maximum amount in the feeding schedule\"}\n");
       return;
     }
 
@@ -641,12 +760,16 @@ void setup() {
   });
 
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
-    char buffer[100];
-    snprintf(buffer, 100, "{\"%s\":\"%s\",\"%s\":\"%s\"}", 
+    char buffer[200];
+    snprintf(buffer, 200, "{\"%s\":\"%s\",\"%s\":\"%s\",\"ipAddress\":\"%s\",\"subnetMask\":\"%s\",\"dns\":\"%s\",\"mac\":\"%s\"}", 
       PREF_WIFI_SSID_KEY, 
       preferences.getString(PREF_WIFI_SSID_KEY, "").c_str(),
       PREF_WIFI_PASS_KEY,
-      preferences.getString(PREF_WIFI_PASS_KEY, "").c_str()
+      preferences.getString(PREF_WIFI_PASS_KEY, "").c_str(),
+      preferences.getString(PREF_WIFI_IP, WiFi.localIP().toString()).c_str(),
+      WiFi.subnetMask().toString().c_str(),
+      preferences.getString(PREF_DNS, WiFi.dnsIP().toString()).c_str(),
+      WiFi.macAddress().c_str()
     );
 
     request->send(200, "application/json", buffer);
@@ -674,71 +797,46 @@ void setup() {
       return;
     }
 
+    if (request->hasParam("ip", true)       && 
+        request->hasParam("gateway", true)  && 
+        request->hasParam("submask", true)  && 
+        request->hasParam("dns", true)
+    ) {
+      IPAddress staticIP, gateway, subnet, dns;
+      if (!staticIP.fromString(request->getParam("ip", true)->value()) ||
+          !gateway.fromString(request->getParam("gateway", true)->value()) ||
+          !subnet.fromString(request->getParam("subnet", true)->value()) ||
+          !dns.fromString(request->getParam("dns", true)->value())
+      ) {
+        request->send(400, "application/json", "{\"message\": \"static config value is not a valid ip address\"}\n");
+        xSemaphoreGive(wifiFileMutex);
+
+        return;
+      }
+
+      if (preferences.putString(PREF_WIFI_IP, request->getParam("ip", true)->value()) == 0            ||
+          preferences.putString(PREF_WIFI_SUBMASK, request->getParam("submask", true)->value()) == 0  ||
+          preferences.putString(PREF_DNS, request->getParam("dns", true)->value()) == 0               ||
+          preferences.putString(PREF_WIFI_GATEWAY, request->getParam("gateway", true)->value()) == 0
+      ) {
+        request->send(500, "application/json", "{\"message\": \"failed to store data\"}\n");
+        xSemaphoreGive(wifiFileMutex);
+
+        return;
+      }
+
+      if (!WiFi.config(staticIP, gateway, subnet, dns)) {
+        request->send(500, "application/json", "{\"message\": \"failed to apply static configuration\"}\n");
+        xSemaphoreGive(wifiFileMutex);
+
+        return;
+      }
+    }
+
     request->send(204);
     vTaskDelay(1000);
 
     WiFi.begin(preferences.getString(PREF_WIFI_SSID_KEY, "").c_str(), preferences.getString(PREF_WIFI_PASS_KEY, "").c_str());
-    xSemaphoreGive(wifiFileMutex);
-  });
-
-  AsyncCallbackJsonWebHandler* wifiPostHandler = 
-    new AsyncCallbackJsonWebHandler("/wifi", [](AsyncWebServerRequest* request, JsonVariant &json) {
-    if (json.is<JsonArray>()) {
-      request->send(400, "application/json", "{\"message\": \"invalid request\"}\n");
-      return;
-    }
-
-    if (xSemaphoreTake(wifiFileMutex, portMAX_DELAY) != pdTRUE) {
-      request->send(500, "text/plain", "internal server error");
-
-      return;
-    }
-
-    if (!json.containsKey("ssid")) {
-      request->send(400, "application/json", "{\"message\": \"missing ssid field\"}\n");
-      xSemaphoreGive(wifiFileMutex);      
-
-      return;
-    }
-
-    // FileHandler fileHandler(SPIFFS);
-
-    // if(!fileHandler.readJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-    //   request->send(500, "application/json", "{\"message\": \"failed reading a file\"}");
-    //   xSemaphoreGive(wifiFileMutex);
-
-    //   return;
-    // }
-
-    // wifiCredentialsDoc["ssid"] = json["ssid"];
-    // if (json.containsKey("password"))
-    //   wifiCredentialsDoc["password"] = json["password"];
-    
-    // if (!fileHandler.writeJson(WIFI_CRED_FILE_PATH, wifiCredentialsDoc)) {
-      // request->send(500, "application/json", "{\"message\": \"failed opening a file\"}\n");
-      // xSemaphoreGive(wifiFileMutex);
-
-      // return;
-    // }
-
-    if (preferences.putString(PREF_WIFI_SSID_KEY, json["ssid"].as<const char*>()) == 0) {
-      request->send(500, "application/json", "{\"message\": \"failed to store ssid\"}\n");
-      xSemaphoreGive(wifiFileMutex);
-
-      return;
-    }
-
-    if (json.containsKey("password"))
-      if (preferences.putString(PREF_WIFI_PASS_KEY, json["password"].as<const char*>()) == 0) {
-        request->send(500, "application/json", "{\"message\": \"failed to store password\"}\n");
-        xSemaphoreGive(wifiFileMutex);
-  
-        return;
-      }
-
-
-    request->send(204);
-    WiFi.begin(wifiCredentialsDoc["ssid"].as<const char*>(), wifiCredentialsDoc["password"].as<const char*>());
     xSemaphoreGive(wifiFileMutex);
   });
 
@@ -796,18 +894,14 @@ void setup() {
       return;
     }
 
-    if (!fileHandler.readJson(SERVO_CONFIG_FILE_PATH, servoConfigDoc)) {
-      request->send(500, "application/json", "{\"message\": \"failed to read from file\"}");
-      xSemaphoreGive(servoConfigMutex);
+    bool queueContent = true;
 
-      return;
+    if (xQueueSend(servoQueue, (void *) &queueContent, static_cast<TickType_t>(10)) != pdPASS) {
+      request->send(500, "application/json", "{\"message\": \"error when processing data\"}");      
+    } else {
+      request->send(202, "application/json", "{\"message\": \"success\"}");
     }
 
-    // unsigned int delayMs = servoConfigDoc["servoOpenMs"].as<unsigned int>();
-
-    openServo(servoConfigDoc["servoOpenMs"].as<int>());
-
-    request->send(200, "application/json", "{\"message\": \"success\"}");
     xSemaphoreGive(servoConfigMutex);
   });
 
@@ -875,7 +969,7 @@ void setup() {
     request->send(response);
 
   }, [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
-    log_d("Handling file upload, filename = %s | index = %d | len = %d | final = %d", filename.c_str(), index, len, final);
+    log_v("Handling file upload, filename = %s | index = %d | len = %d | final = %d", filename.c_str(), index, len, final);
     if(len){
       if (Update.write(data, len) != len) {
         return request->send(400, "text/plain", "Failed to write chunked data to free space");
@@ -884,7 +978,7 @@ void setup() {
         
     if (final) {
       if (!Update.end(true)) {
-        log_d("/update: %s", String(Update.getError()).c_str());
+        log_e("/update: %s", String(Update.getError()).c_str());
       }
 
       log_i("Update successfully completed. Please reboot your device");
@@ -894,28 +988,166 @@ void setup() {
   });
 
   server.on("/reset", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (mqttClient.connected()) {
+      char mqttPayload[100];
+      snprintf(mqttPayload, 100, "{\"id\":\"%s\",\"type\":\"deviceResetNotification\"}", generateRandomString(10).c_str());
+      
+      if (!mqttClient.publish(MQTT_TOPIC, mqttPayload, true, 1)) {
+        log_e("Error publishing to queue");
+      }
+    }
+
     request->send(204);
 
+    mqttClient.disconnect();
     vTaskDelay(1000);
     ESP.restart();
   });
 
-  ws.onEvent(onEvent);
+  server.on("/hardware", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, HARDWARE_INFO_FILE_PATH, "application/json");
+  });
 
-  server.addHandler(&ws);
+  server.on("/time-server", HTTP_GET, [](AsyncWebServerRequest* request) {
+    char buffer[100];
+    snprintf(
+      buffer, 
+      100, 
+      "{\"server1\":\"%s\",\"server2\":\"%s\",\"server3\":\"%s\"}", 
+      preferences.getString(PREF_TIME_SERVER_URL_KEY1, "pool.ntp.org").c_str(),
+      preferences.getString(PREF_TIME_SERVER_URL_KEY2, "").c_str(),
+      preferences.getString(PREF_TIME_SERVER_URL_KEY3, "").c_str()
+    );
+
+    request->send(200, "application/json", buffer);
+  });
+
+  server.on("/time-server", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("url", true) || !request->hasParam("index", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing required field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(timeServerConfigMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+      return;
+    }
+
+    switch (request->getParam("index", true)->value().toInt()) {
+      case 1:
+        if (preferences.putString(PREF_TIME_SERVER_URL_KEY1, request->getParam("url", true)->value()) == 0) {
+          request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+      case 2:
+        if (preferences.putString(PREF_TIME_SERVER_URL_KEY2, request->getParam("url", true)->value()) == 0) {
+          request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+
+      case 3:
+        if (preferences.putString(PREF_TIME_SERVER_URL_KEY3, request->getParam("url", true)->value()) == 0) {
+          request->send(500, "application/json", "{\"message\": \"failed to store data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+      default:
+        request->send(400, "application/json", "{\"message\": \"index field should be between 1 and 3\"}");
+        xSemaphoreGive(timeServerConfigMutex);
+
+        return;     
+    }
+
+    request->send(204);
+    initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
+
+    xSemaphoreGive(timeServerConfigMutex);
+  });
+
+  server.on("/time-server", HTTP_DELETE, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("index", true)) {
+      request->send(400, "application/json", "{\"message\": \"missing required field\"}");
+      return;
+    }
+
+    if (xSemaphoreTake(timeServerConfigMutex, portMAX_DELAY) != pdTRUE) {
+      request->send(500, "text/plain", "internal server error");
+      return;
+    }
+
+    switch (request->getParam("index", true)->value().toInt()) {
+      case 1:
+        if (!preferences.remove(PREF_TIME_SERVER_URL_KEY1)) {
+          request->send(500, "application/json", "{\"message\": \"failed to remove data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+      case 2:
+        if (!preferences.remove(PREF_TIME_SERVER_URL_KEY2)) {
+          request->send(500, "application/json", "{\"message\": \"failed to remove data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+
+      case 3:
+        if (!preferences.remove(PREF_TIME_SERVER_URL_KEY3)) {
+          request->send(500, "application/json", "{\"message\": \"failed to remove data\"}");
+          xSemaphoreGive(timeServerConfigMutex);
+
+          return;
+        }
+
+        break;
+      default:
+        request->send(400, "application/json", "{\"message\": \"index field should be between 1 and 3\"}");
+        xSemaphoreGive(timeServerConfigMutex);
+
+        return;     
+    }
+
+    request->send(204);
+    initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
+
+    xSemaphoreGive(timeServerConfigMutex);
+  });
+
+  // ws.onEvent(onEvent);
+
+  // server.addHandler(&ws);
   server.addHandler(feedingSchedulePostHandler);
   server.addHandler(urlListPostHandler);
   // server.addHandler(wifiPostHandler);
 
   server.begin();
 
-  initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
+  // Init Camera
+  initCamera();
 
   while (WiFi.status() != WL_CONNECTED) {
-    log_i("Could not connect to wifi, waiting for wifi connection");
+    uint32_t wifiMillis = millis();
+    log_w("Could not connect to wifi, waiting for wifi connection");
 
-    delay(3000);
+    while (millis() - wifiMillis < 1000) {}
   }
+
+  initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
 
   if (preferences.getString(PREF_MQTT_HOST_KEY, "") != "") {
     mqttClient.begin(
@@ -923,43 +1155,19 @@ void setup() {
       preferences.getUInt(PREF_MQTT_PORT_KEY, 1883), 
       wifiClient);
 
-    mqttClient.setTimeout(10000);
+    mqttClient.setOptions(60000, false, 10000);
+    mqttClient.setWill(MQTT_TOPIC, "{\"type\": \"lastWill\"}", true, LWMQTT_QOS1);
+
     mqttClient.onMessage(messageReceived);
 
-
-    if (preferences.getString(PREF_MQTT_USERNAME, "") == "") {
-      if (!mqttClient.connect("petBowlCam")) {
-        log_w("Error connecting to MQTT client");
-      } else {
-        if (!mqttClient.subscribe("petBowlCam/test")) {
-          log_e("Error subscribing to queue");
-        }
-        if (!mqttClient.publish("petBowlCam/test", "testing", true, 1)) {
-          log_e("Error publishing to queue");
-        }
-      }
-    } else {
-      if (!mqttClient.connect(
-        "petBowlCam", 
-        preferences.getString(PREF_MQTT_USERNAME, "").c_str(),
-        preferences.getString(PREF_MQTT_PASSWORD, "").c_str())
-      ) {
-        log_w("Error connecting to MQTT client");
-      } else {
-        if (!mqttClient.subscribe("petBowlCam/test")) {
-          log_e("Error subscribing to queue");
-        }
-        if (!mqttClient.publish("petBowlCam/test", "testing", true, 1)) {
-          log_e("Error publishing to queue");
-        }
-      }
+    if (!mqttConnect()) {
+        log_w("Error connecting to MQTT client: %d | return: %d", mqttClient.lastError(), mqttClient.returnCode());
     }
   }
 
+  randomSeed(millis());
 
   digitalWrite(LED_BUILTIN, HIGH);
-
-  log_d("test update upload from web 2");
 }
 
 void loop() {
@@ -968,21 +1176,58 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   mqttClient.loop();
+  delay(10);
 
-  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) != nullptr || 
-      xSemaphoreGetMutexHolder(urlFileMutex) != nullptr         ||
-      xSemaphoreGetMutexHolder(tzFileMutex) != nullptr          || 
-      xSemaphoreGetMutexHolder(wifiFileMutex) != nullptr        ||
-      xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr     ||
+  if (xSemaphoreGetMutexHolder(feedingScheduleMutex) != nullptr   || 
+      xSemaphoreGetMutexHolder(urlFileMutex) != nullptr           ||
+      xSemaphoreGetMutexHolder(tzFileMutex) != nullptr            || 
+      xSemaphoreGetMutexHolder(wifiFileMutex) != nullptr          ||
+      xSemaphoreGetMutexHolder(servoConfigMutex) != nullptr       ||
+      xSemaphoreGetMutexHolder(timeServerConfigMutex) != nullptr  ||
       xSemaphoreGetMutexHolder(mqttFileMutex) != nullptr) {
       
     return;
   }
 
-  if(!getLocalTime(&timeinfo)){
-    log_w("Failed to fetch local time");
+  if (xQueueReceive(servoQueue, &shouldOpenServo, (TickType_t) 10)) {
+    if (shouldOpenServo)
+      openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY));
+    
+    delay(10);
+  }
+
+  if(!getLocalTime(&timeinfo)) {
+    log_w("Failed to fetch local time, %d:%d", timeinfo.tm_hour, timeinfo.tm_min);
+
+    if (mqttClient.connected() && timeErrorId == "") {
+      timeErrorId = generateRandomString(10);
+      log_i("publish to queue");
+      char payload[100];
+      snprintf(payload, 100, "{\"id\":\"%s\", \"type\":\"getLocalTime\",\"error\":true}", timeErrorId.c_str());
+
+      if (!mqttClient.publish(MQTT_TOPIC, payload, true, 1)) {
+        log_e("Error publishing to queue: %d", mqttClient.lastError());
+        timeErrorId = "";
+      }
+    }
+
+    initTimezone(preferences.getString(PREF_TZ_KEY, "UTC0").c_str());
+
     return;
   }
+
+  // publish to queue when getLocalTime 
+  if (timeErrorId != "" && mqttClient.connected()) {
+    char payload[100];
+    snprintf(payload, 100, "{\"id\":\"%s\", \"type\":\"getLocalTime\",\"error\":false}", timeErrorId.c_str());
+
+    if (!mqttClient.publish(MQTT_TOPIC, payload, true, 1)) {
+      log_e("Error publishing to queue: %d", mqttClient.lastError());
+      timeErrorId = "";
+    }
+  }
+
+  timeErrorId = "";
 
   JsonArray arrDoc = feedingScheduleDoc.as<JsonArray>();
   for (JsonVariant v : arrDoc) {
@@ -1010,32 +1255,32 @@ void loop() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
       log_e("Failed at getting camera framebuffer");
+      currentMillis = millis();
+
       continue;
     }
 
 
     int encodedLength = Base64.encodedLength(fb->len);
-    log_d("Length: %d", encodedLength);
+    log_v("base64 image length: %d", encodedLength);
 
     char* encodedString = (char*)malloc(encodedLength * sizeof(char) + 1);
     Base64.encode(encodedString, reinterpret_cast<char*>(fb->buf), fb->len);
 
     esp_camera_fb_return(fb);
-    log_d("Deallocate camera framebuffer");
+    log_v("Deallocate camera framebuffer");
 
     String reqBody = "--camBoundary\r\nContent-Disposition: form-data; name=\"file_base64\"\r\n\r\n";
     reqBody += encodedString;
     reqBody += "\r\n--camBoundary--\r\n";
 
     free(encodedString);
-    log_d("Successfully deallocate base64 variable");
+    log_v("Successfully deallocate base64 variable");
 
-    log_d("start request");
+    log_v("start request");
 
-    int retries = 0;
+    int retries = 0, httpCode = 0;
     HTTPClient http;
-
-    int httpCode = 0;
 
     http.begin(url.c_str());
 
@@ -1044,7 +1289,7 @@ void loop() {
     http.addHeader("accept", "application/json");
 
     do {
-      http.setTimeout(10000);
+      http.setTimeout(30000);
       http.useHTTP10(false);
       http.setReuse(false);
 
@@ -1059,8 +1304,12 @@ void loop() {
 
 
     if (retries <= 5) {
-      log_d("Getting response body");
+      log_v("Getting response body");
+
       String payload = http.getString();
+      // char responsePayload[http.getSize() + 1];
+      
+      // http.getStream().readBytes(responsePayload, http.getSize());
 
       deserializeJson(httpPredictionResponseDoc, payload);
 
@@ -1068,33 +1317,72 @@ void loop() {
       serializeJson(httpPredictionResponseDoc, responseOutput);
       responseOutput += '\n';
 
-      log_d("response: %s", responseOutput.c_str());
+      char mqttPayload[200];
+      snprintf(
+        mqttPayload, 
+        200, 
+        "{\"id\":\"%s\",\"type\":\"serverResponse\",\"status\":%d,\"data\":\"%s\"}", 
+        generateRandomString(10).c_str(), 
+        httpCode, 
+        payload.c_str()
+      );
 
-      ws.textAll(responseOutput.c_str());
+      log_v("response: %s", payload.c_str());
+      log_v("data length: %d", strlen(mqttPayload));
+
+      if (mqttClient.connected()) {
+        log_i("publish to queue");
+        if (!mqttClient.publish(MQTT_TOPIC, mqttPayload, true, 1)) {
+          log_e("Error publishing to queue: %d", mqttClient.lastError());
+        }
+      } else {
+        if (mqttConnect()) {
+          log_i("publish to queue");
+          if (!mqttClient.publish(MQTT_TOPIC, mqttPayload, true, 1)) {
+            log_e("Error publishing to queue: %d", mqttClient.lastError());
+          }
+        }
+      }
+
       String topPrediction = httpPredictionResponseDoc["top"].as<String>();
-
       if (topPrediction == "unfinished_bowl" || topPrediction == "empty_bowl") {
-        digitalWrite(LED_BUILTIN, LOW);
-
         openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0));
-
-        digitalWrite(LED_BUILTIN, HIGH);
-      } else if (topPrediction == "floor") {
-        log_d("prediction is floor, ignoring");
       }
     } else {
-      ws.textAll("Failed to send payload");
       log_w("Failed to send payload");
 
+      char mqttPayload[100];
+      snprintf(
+        mqttPayload, 
+        100, 
+        "{\"id\":\"%s\",\"type\":\"serverResponse\",\"status\":%d,\"data\":\"%s\"}", 
+        generateRandomString(10).c_str(), 
+        httpCode, 
+        HTTPClient::errorToString(httpCode).c_str()
+      );
+
+      if (mqttClient.connected()) {
+        log_i("publish to queue");
+
+        if (!mqttClient.publish(MQTT_TOPIC, mqttPayload, true, 1)) {
+          log_e("Error publishing to queue: %d", mqttClient.lastError());
+        }
+      } else {
+        if (mqttConnect()) {
+          log_i("publish to queue");
+          if (!mqttClient.publish(MQTT_TOPIC, mqttPayload, true, 1)) {
+            log_e("Error publishing to queue: %d", mqttClient.lastError());
+          }
+        }
+      }
+
       if (preferences.getBool(PREF_OPEN_SERVO_IF_TIMEOUT_KEY, true)) {  
-        digitalWrite(LED_BUILTIN, LOW);
         openServo(preferences.getUInt(PREF_SERVO_OPEN_MS_KEY, 0));
-        digitalWrite(LED_BUILTIN, HIGH);
       }
     }
 
     http.end();
-    log_d("HTTPClient end() called");
+    log_v("HTTPClient end() called");
 
     currentMillis = millis();
   }

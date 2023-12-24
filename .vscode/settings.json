@@ -1,10 +1,9 @@
 {
-    // "cmake.sourceDirectory": "/home/bryan/repos/pet_bowl_cam/.pio/libdeps/esp32cam/esp32-camera",
     "clangd.arguments": [
         "--compile-commands-dir=${env:HOME}/repos/pet_bowl_cam/.pio/build/esp32cam/",
         "--log=info",
         "--enable-config",
         "--clang-tidy",
         "--query-driver=${env:HOME}/.platformio/packages/toolchain-xtensa-esp32/bin/xtensa-esp32-elf-g++"
-    ]
+    ],
 }
